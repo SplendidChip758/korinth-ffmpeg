@@ -435,7 +435,10 @@ def narrate(job: str, index: int, request: Request, body: NarrateBody) -> dict:
     token = _vertex_access_token()
 
     body = {
-        "contents": [{"parts": [{"text": style + text}]}],
+        # Vertex AI's generateContent rejects a content entry with no role
+        # ("Please use a valid role: user, model.") - the AI Studio endpoint
+        # this was ported from defaults it, Vertex doesn't.
+        "contents": [{"role": "user", "parts": [{"text": style + text}]}],
         "generationConfig": {
             "responseModalities": ["AUDIO"],
             "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}},
