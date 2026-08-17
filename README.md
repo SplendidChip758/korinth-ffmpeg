@@ -33,7 +33,18 @@ the constant on the shorts pipeline has needed recalibrating twice.
 `/assemble` returns 409 if any segment is missing its narration; pass
 `?allow_silent=1` to render anyway for inspection. A silent segment ships
 broken without erroring, so the default is to fail before n8n reaches the
-upload node.
+upload node. `/assemble` also checks segment indices are contiguous (409 with
+the gap list unless `?allow_gaps=1`) and, if `?expect=N` is passed, that
+exactly `N` segments showed up — both cover a generation step that failed
+silently rather than one that errored loudly.
+
+If `ARCHIVE_DIR` is set, `/assemble` copies the finished mp4 there (as
+`{job}.mp4`, written atomically) before deleting the job folder — pass
+`?deliver=path` to get back a small JSON pointer (`{"path": ...}`) instead of
+the full video bytes over HTTP, useful when n8n just needs to hand the file to
+a downstream step rather than hold it in memory. Without `ARCHIVE_DIR`,
+`?deliver=path` 400s, and the default behaviour is unchanged: the bytes stream
+back and nothing is kept on disk after the response.
 
 ## Deploy / update
 
@@ -111,9 +122,10 @@ curl -H "X-Auth-Token: $TOKEN" http://192.168.20.129:8080/health
 `install.sh` runs it unquieted. If a fresh LXC's install seems stuck on
 venv/pip setup, check DNS/routing first — the real error is in that output.
 
-`DATA_DIR` must stay in step with `ReadWritePaths=` in
+`DATA_DIR` and `ARCHIVE_DIR` must both stay in step with `ReadWritePaths=` in
 `systemd/korinth-ffmpeg.service`. `ProtectSystem=strict` means a mismatch shows
-up as read-only-filesystem errors on the first `PUT`, not at startup.
+up as read-only-filesystem errors on the first `PUT` or `/assemble`, not at
+startup.
 
 Long-form stills are upscaled to 3840x2160 before `zoompan`. Imagen caps at 2K,
 and cropping a 2K source down to a 1080p output leaves only ~1.07x of travel —

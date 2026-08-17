@@ -47,6 +47,7 @@ from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import service_account
@@ -63,6 +64,11 @@ SERVICE_TOKEN = (os.environ.get("X_AUTH_TOKEN")
 MAX_JOB_AGE_SECONDS = int(os.environ.get("MAX_JOB_AGE_SECONDS", 6 * 60 * 60))
 MAX_CLIP_BYTES = int(os.environ.get("MAX_CLIP_BYTES", 200 * 1024 * 1024))
 FFMPEG_TIMEOUT = int(os.environ.get("FFMPEG_TIMEOUT", 1800))
+
+# Finished episodes are copied here instead of vanishing with the job folder.
+# Unset = old behaviour (stream the bytes back, destroy everything).
+_archive = os.environ.get("ARCHIVE_DIR", "").strip()
+ARCHIVE_DIR = Path(_archive) if _archive else None
 
 AMBIENT_VOLUME = os.environ.get("AMBIENT_VOLUME", "0.30")
 PAD_SECONDS = float(os.environ.get("PAD") or os.environ.get("PAD_SECONDS") or "0.4")
@@ -185,6 +191,30 @@ def sweep_old_jobs() -> None:
                 shutil.rmtree(entry, ignore_errors=True)
         except OSError:
             pass
+
+
+def archive_final(job: str, src: Path) -> Optional[str]:
+    """Copy the finished mp4 onto the share.
+
+    Written to a dotfile then renamed. os.replace is atomic within a
+    directory, so a reader watching the share never sees a partial file -
+    which matters because n8n starts reading the moment this call returns.
+    """
+    if ARCHIVE_DIR is None:
+        return None
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    dest = ARCHIVE_DIR / f"{job}.mp4"
+    tmp = ARCHIVE_DIR / f".{job}.mp4.part"
+    try:
+        shutil.copyfile(src, tmp)
+        os.replace(tmp, dest)
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"could not write to ARCHIVE_DIR {ARCHIVE_DIR}: {exc}. "
+                   f"Check the share is mounted and writable by this service.")
+    return str(dest)
 
 
 def run(cmd, cwd) -> subprocess.CompletedProcess:
@@ -324,6 +354,8 @@ def health() -> dict:
         "tts_voice": TTS_VOICE,
         "gcp_project": gcp_project,
         "gcp_location": GCP_LOCATION,
+        "archive_dir": str(ARCHIVE_DIR) if ARCHIVE_DIR else None,
+        "archive_writable": bool(ARCHIVE_DIR and os.access(ARCHIVE_DIR, os.W_OK)),
     }
 
 
@@ -496,7 +528,7 @@ def narrate(job: str, index: int, request: Request, body: NarrateBody) -> dict:
 
 @app.post("/assemble/{job}")
 def assemble(job: str, request: Request, allow_silent: int = 0,
-             allow_gaps: int = 0, expect: int = 0) -> Response:
+             allow_gaps: int = 0, expect: int = 0, deliver: str = "file") -> Response:
     check_auth(request)
     sweep_old_jobs()
 
@@ -622,20 +654,45 @@ def assemble(job: str, request: Request, allow_silent: int = 0,
                             detail=f"concat failed: {(proc.stderr or '')[-1500:]}")
 
     total = probe_duration(d / final)
+    archived = archive_final(job, d / final)
+
+    stats = {
+        "X-Segment-Count": str(len(parts)),
+        "X-Image-Count": str(images),
+        "X-Clip-Count": str(videos),
+        "X-Narration-Count": str(narrations),
+        "X-Duration": f"{total:.2f}",
+    }
+    if archived:
+        stats["X-Archive-Path"] = archived
+
+    if deliver == "path":
+        if archived is None:
+            raise HTTPException(
+                status_code=400,
+                detail="?deliver=path needs ARCHIVE_DIR set in the service env")
+        shutil.rmtree(d, ignore_errors=True)
+        return JSONResponse(
+            {
+                "job": job,
+                "path": archived,
+                "file": f"{job}.mp4",
+                "segments": len(parts),
+                "images": images,
+                "clips": videos,
+                "narrations": narrations,
+                "duration_seconds": round(total, 2),
+            },
+            headers=stats,
+        )
+
     data = (d / final).read_bytes()
     shutil.rmtree(d, ignore_errors=True)
-
     return Response(
         content=data,
         media_type="video/mp4",
-        headers={
-            "Content-Disposition": f'attachment; filename="{job}.mp4"',
-            "X-Segment-Count": str(len(parts)),
-            "X-Image-Count": str(images),
-            "X-Clip-Count": str(videos),
-            "X-Narration-Count": str(narrations),
-            "X-Duration": f"{total:.2f}",
-        },
+        headers={**stats,
+                 "Content-Disposition": f'attachment; filename="{job}.mp4"'},
     )
 
 

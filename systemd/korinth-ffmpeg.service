@@ -18,7 +18,10 @@ Group=korinth
 # ffmpeg is CPU-hungry; keep it from starving the rest of the container.
 Nice=5
 
-# Hardening. The service only ever needs to write to its own data dir.
+# Hardening. ProtectSystem=strict makes the whole filesystem read-only except
+# the paths named below - a missing entry here shows up as EROFS at the write
+# site, not at startup. The service only ever needs its own data dir plus,
+# if ARCHIVE_DIR is set, the share it copies finished episodes onto.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
@@ -26,7 +29,7 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
-ReadWritePaths=/var/lib/korinth-ffmpeg
+ReadWritePaths=/var/lib/korinth-ffmpeg /mnt/korinth-out
 
 [Install]
 WantedBy=multi-user.target
