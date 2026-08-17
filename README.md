@@ -53,16 +53,15 @@ to it by hand first.
 
 `POST /narrate` calls Gemini on **Vertex AI**, authenticated as a service
 account — GEAP's GCP project issues service account keys, not AI Studio
-`GEMINI_API_KEY` values. It needs:
+`GEMINI_API_KEY` values. It needs one thing: a service account JSON key
+(role: Vertex AI User) at `/etc/korinth-ffmpeg/service-account.json`, placed
+by hand — the installer has no way to generate one. The project id is read
+straight out of the key file's own `project_id` field, so there's no separate
+project config to keep in sync.
 
-- a service account JSON key at `/etc/korinth-ffmpeg/service-account.json`
-  (role: Vertex AI User), placed by hand — the installer has no way to
-  generate one
-- `GCP_PROJECT_ID` set in `/etc/korinth-ffmpeg.env`
-
-See `korinth-ffmpeg.env.example` for the exact setup steps. Until both are in
-place the route returns 500; `/health` reports `tts_configured` so this is
-visible without a test render.
+See `korinth-ffmpeg.env.example` for the exact setup steps. Until the key is
+in place the route returns 500; `/health` reports `tts_configured` and
+`gcp_project` so this is visible without a test render.
 
 To deploy a specific tag/commit instead of `main`:
 

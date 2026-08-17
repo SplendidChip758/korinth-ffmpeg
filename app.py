@@ -74,7 +74,10 @@ OUT_W, OUT_H = 1920, 1080
 WORK_W, WORK_H = 3840, 2160
 
 # Vertex AI (service account), not the AI Studio API-key surface — GEAP's GCP
-# project only issues service account keys, not GEMINI_API_KEY values.
+# project only issues service account keys, not GEMINI_API_KEY values. The
+# project id lives in the key file itself, so GCP_PROJECT_ID is only needed to
+# override it (e.g. calling Vertex in a different project than the one that
+# issued the key) — leave it unset in the normal case.
 GOOGLE_APPLICATION_CREDENTIALS = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
 GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "").strip()
 GCP_LOCATION = os.environ.get("GCP_LOCATION", "us-central1").strip()
@@ -105,7 +108,7 @@ GIT_SHA = os.environ.get("KORINTH_GIT_SHA", "").strip() or "unknown"
 SAFE_JOB = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MOTIONS = ("zoom_in", "zoom_out", "pan_left", "pan_right", "kenburns")
 
-TTS_CONFIGURED = bool(GOOGLE_APPLICATION_CREDENTIALS and GCP_PROJECT_ID)
+TTS_CONFIGURED = bool(GOOGLE_APPLICATION_CREDENTIALS)
 
 app = FastAPI(title="Korinth ffmpeg service", version=VERSION)
 
@@ -114,34 +117,45 @@ app = FastAPI(title="Korinth ffmpeg service", version=VERSION)
 # /narrate is a sync endpoint, so FastAPI runs it in a threadpool and two
 # requests really can land here at once - hence the lock.
 _vertex_credentials = None
+_vertex_project_id = GCP_PROJECT_ID or None
 _vertex_lock = threading.Lock()
 
 
-def _vertex_access_token() -> str:
-    global _vertex_credentials
+def _load_vertex_credentials() -> service_account.Credentials:
+    """Parses the key file and caches it. No network call - safe to use from /health."""
+    global _vertex_credentials, _vertex_project_id
     if not TTS_CONFIGURED:
         raise HTTPException(
             status_code=500,
-            detail="GOOGLE_APPLICATION_CREDENTIALS and GCP_PROJECT_ID must be "
-                   "set in /etc/korinth-ffmpeg.env")
-    with _vertex_lock:
-        if _vertex_credentials is None:
-            try:
-                _vertex_credentials = service_account.Credentials.from_service_account_file(
-                    GOOGLE_APPLICATION_CREDENTIALS,
-                    scopes=["https://www.googleapis.com/auth/cloud-platform"])
-            except (OSError, ValueError) as e:
-                raise HTTPException(status_code=500,
-                                    detail=f"failed to load service account credentials: {e}")
-        # Access tokens are short-lived; refresh() is a no-op if the cached one
-        # still has enough lifetime left, so it's cheap to call on every request.
-        if not _vertex_credentials.valid:
-            try:
-                _vertex_credentials.refresh(GoogleAuthRequest())
-            except Exception as e:
-                raise HTTPException(status_code=502,
-                                    detail=f"failed to refresh service account token: {e}")
-        return _vertex_credentials.token
+            detail="GOOGLE_APPLICATION_CREDENTIALS must be set in /etc/korinth-ffmpeg.env")
+    if _vertex_credentials is None:
+        with _vertex_lock:
+            if _vertex_credentials is None:
+                try:
+                    creds = service_account.Credentials.from_service_account_file(
+                        GOOGLE_APPLICATION_CREDENTIALS,
+                        scopes=["https://www.googleapis.com/auth/cloud-platform"])
+                except (OSError, ValueError) as e:
+                    raise HTTPException(status_code=500,
+                                        detail=f"failed to load service account credentials: {e}")
+                _vertex_project_id = GCP_PROJECT_ID or creds.project_id
+                _vertex_credentials = creds
+    return _vertex_credentials
+
+
+def _vertex_access_token() -> str:
+    creds = _load_vertex_credentials()
+    # Access tokens are short-lived; refresh() is a no-op if the cached one
+    # still has enough lifetime left, so it's cheap to call on every request.
+    if not creds.valid:
+        with _vertex_lock:
+            if not creds.valid:
+                try:
+                    creds.refresh(GoogleAuthRequest())
+                except Exception as e:
+                    raise HTTPException(status_code=502,
+                                        detail=f"failed to refresh service account token: {e}")
+    return creds.token
 
 
 # --------------------------------------------------------------------------
@@ -292,6 +306,12 @@ VIDEO_ARGS = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
 @app.get("/health")
 def health() -> dict:
     ff = ffmpeg_version()
+    gcp_project = _vertex_project_id
+    if gcp_project is None and TTS_CONFIGURED:
+        try:
+            gcp_project = _load_vertex_credentials().project_id
+        except HTTPException:
+            pass  # bad/missing key file - surfaced properly by /narrate
     return {
         "status": "ok" if shutil.which("ffmpeg") and shutil.which("ffprobe") else "degraded",
         "version": VERSION,
@@ -302,7 +322,7 @@ def health() -> dict:
         "tts_configured": TTS_CONFIGURED,
         "tts_model": TTS_MODEL,
         "tts_voice": TTS_VOICE,
-        "gcp_project": GCP_PROJECT_ID or None,
+        "gcp_project": gcp_project,
         "gcp_location": GCP_LOCATION,
     }
 
@@ -421,7 +441,7 @@ def narrate(job: str, index: int, request: Request, body: NarrateBody) -> dict:
             "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}},
         },
     }
-    url = (f"https://{GCP_LOCATION}-aiplatform.googleapis.com/v1/projects/{GCP_PROJECT_ID}"
+    url = (f"https://{GCP_LOCATION}-aiplatform.googleapis.com/v1/projects/{_vertex_project_id}"
            f"/locations/{GCP_LOCATION}/publishers/google/models/{TTS_MODEL}:generateContent")
 
     try:
