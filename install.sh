@@ -32,7 +32,15 @@ apt-get install -y --no-install-recommends \
 id -u "${APP_USER}" >/dev/null 2>&1 \
   || useradd --system --home-dir "${INSTALL_DIR}" --shell /usr/sbin/nologin "${APP_USER}"
 
-mkdir -p "${INSTALL_DIR}" "${DATA_DIR}"
+mkdir -p "${INSTALL_DIR}" "${DATA_DIR}" /etc/korinth-ffmpeg
+
+# The service account key for Vertex AI (POST /narrate) is dropped here by
+# hand — install.sh has no way to obtain it. If it's already present, keep its
+# permissions correct on every re-run.
+if [ -f /etc/korinth-ffmpeg/service-account.json ]; then
+  chown root:"${APP_USER}" /etc/korinth-ffmpeg/service-account.json
+  chmod 0640 /etc/korinth-ffmpeg/service-account.json
+fi
 
 # --- 1. get/refresh the code -------------------------------------------------
 if [ -d "${INSTALL_DIR}/.git" ]; then
@@ -124,5 +132,7 @@ echo "   Base URL    http://${IP:-<this-lxc-ip>}:8080"
 echo "   Header      X-Auth-Token"
 echo "   Token       ${TOKEN_VALUE}"
 echo
-echo " POST /narrate needs GEMINI_API_KEY in ${ENV_FILE}."
+echo " POST /narrate needs a Vertex AI service account key at"
+echo " /etc/korinth-ffmpeg/service-account.json, and GCP_PROJECT_ID set in"
+echo " ${ENV_FILE}. See korinth-ffmpeg.env.example for setup steps."
 echo "======================================================================"

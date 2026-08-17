@@ -51,9 +51,18 @@ systemd unit, restart, confirm via `/health`. It never touches
 the n8n Header Auth credential. Run it as root; a bare LXC needs nothing done
 to it by hand first.
 
-`POST /narrate` also needs `GEMINI_API_KEY` set in `/etc/korinth-ffmpeg.env` —
-the installer leaves it blank, and the route returns 500 until it is filled in.
-`/health` reports `tts_configured` so this is visible without a test render.
+`POST /narrate` calls Gemini on **Vertex AI**, authenticated as a service
+account — GEAP's GCP project issues service account keys, not AI Studio
+`GEMINI_API_KEY` values. It needs:
+
+- a service account JSON key at `/etc/korinth-ffmpeg/service-account.json`
+  (role: Vertex AI User), placed by hand — the installer has no way to
+  generate one
+- `GCP_PROJECT_ID` set in `/etc/korinth-ffmpeg.env`
+
+See `korinth-ffmpeg.env.example` for the exact setup steps. Until both are in
+place the route returns 500; `/health` reports `tts_configured` so this is
+visible without a test render.
 
 To deploy a specific tag/commit instead of `main`:
 

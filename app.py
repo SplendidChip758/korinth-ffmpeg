@@ -40,11 +40,16 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
+from pydantic import BaseModel
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2 import service_account
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -68,7 +73,11 @@ OUT_W, OUT_H = 1920, 1080
 # 2K source for a 1080p output leaves only ~1.07x and goes soft immediately.
 WORK_W, WORK_H = 3840, 2160
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+# Vertex AI (service account), not the AI Studio API-key surface — GEAP's GCP
+# project only issues service account keys, not GEMINI_API_KEY values.
+GOOGLE_APPLICATION_CREDENTIALS = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "").strip()
+GCP_LOCATION = os.environ.get("GCP_LOCATION", "us-central1").strip()
 TTS_MODEL = os.environ.get("TTS_MODEL", "gemini-3.1-flash-tts-preview")
 TTS_VOICE = os.environ.get("TTS_VOICE", "Orus")
 TTS_STYLE = os.environ.get(
@@ -96,7 +105,43 @@ GIT_SHA = os.environ.get("KORINTH_GIT_SHA", "").strip() or "unknown"
 SAFE_JOB = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MOTIONS = ("zoom_in", "zoom_out", "pan_left", "pan_right", "kenburns")
 
+TTS_CONFIGURED = bool(GOOGLE_APPLICATION_CREDENTIALS and GCP_PROJECT_ID)
+
 app = FastAPI(title="Korinth ffmpeg service", version=VERSION)
+
+# Loaded lazily (not at import time) so a box with TTS unconfigured can still
+# start and serve every other route; /narrate is what surfaces the error.
+# /narrate is a sync endpoint, so FastAPI runs it in a threadpool and two
+# requests really can land here at once - hence the lock.
+_vertex_credentials = None
+_vertex_lock = threading.Lock()
+
+
+def _vertex_access_token() -> str:
+    global _vertex_credentials
+    if not TTS_CONFIGURED:
+        raise HTTPException(
+            status_code=500,
+            detail="GOOGLE_APPLICATION_CREDENTIALS and GCP_PROJECT_ID must be "
+                   "set in /etc/korinth-ffmpeg.env")
+    with _vertex_lock:
+        if _vertex_credentials is None:
+            try:
+                _vertex_credentials = service_account.Credentials.from_service_account_file(
+                    GOOGLE_APPLICATION_CREDENTIALS,
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"])
+            except (OSError, ValueError) as e:
+                raise HTTPException(status_code=500,
+                                    detail=f"failed to load service account credentials: {e}")
+        # Access tokens are short-lived; refresh() is a no-op if the cached one
+        # still has enough lifetime left, so it's cheap to call on every request.
+        if not _vertex_credentials.valid:
+            try:
+                _vertex_credentials.refresh(GoogleAuthRequest())
+            except Exception as e:
+                raise HTTPException(status_code=502,
+                                    detail=f"failed to refresh service account token: {e}")
+        return _vertex_credentials.token
 
 
 # --------------------------------------------------------------------------
@@ -181,6 +226,26 @@ def decode_b64(payload: dict, field: str) -> bytes:
     return data
 
 
+def segment_indices(d: Path) -> list:
+    """
+    Segment indices present on disk. Only bare numeric stems count - a stray
+    `000_last.png` orphaned by a failed /lastframe call would otherwise reach
+    int() and take the whole assemble down with an uncaught ValueError.
+    """
+    found = set()
+    for pattern in ("[0-9]*.mp4", "[0-9]*.png"):
+        for p in d.glob(pattern):
+            if p.stem.isdigit():
+                found.add(int(p.stem))
+    return sorted(found)
+
+
+class NarrateBody(BaseModel):
+    text: str = ""
+    voice: Optional[str] = None
+    style: Optional[str] = None
+
+
 async def json_body(request: Request) -> dict:
     try:
         return json.loads(await request.body() or b"{}")
@@ -234,9 +299,11 @@ def health() -> dict:
         "ffmpeg": ff,
         "ffprobe": "ok" if shutil.which("ffprobe") else "NOT FOUND",
         "auth": bool(SERVICE_TOKEN),
-        "tts_configured": bool(GEMINI_API_KEY),
+        "tts_configured": TTS_CONFIGURED,
         "tts_model": TTS_MODEL,
         "tts_voice": TTS_VOICE,
+        "gcp_project": GCP_PROJECT_ID or None,
+        "gcp_location": GCP_LOCATION,
     }
 
 
@@ -325,24 +392,27 @@ def last_frame(job: str, index: int, request: Request) -> dict:
 # --------------------------------------------------------------------------
 
 @app.post("/narrate/{job}/{index}")
-async def narrate(job: str, index: int, request: Request) -> dict:
+def narrate(job: str, index: int, request: Request, body: NarrateBody) -> dict:
     """
     Body (JSON): {"text": "...", "voice": "Orus" (optional), "style": "..." (optional)}
     Generates the segment's voiceover via Gemini TTS, writes it as a wav in the
     job directory, and returns its MEASURED duration.
+
+    Deliberately a sync def: this makes a blocking HTTP call and then shells out
+    to ffmpeg. As `async def` both of those stall the event loop for the whole
+    request, so nothing else the service is doing can proceed. Sync handlers run
+    in FastAPI's threadpool instead, which is also what /assemble does.
     """
     check_auth(request)
-    if not GEMINI_API_KEY:
-        raise HTTPException(status_code=500,
-                            detail="GEMINI_API_KEY not set in /etc/korinth-ffmpeg.env")
 
-    payload = await json_body(request)
-    text = str(payload.get("text") or "").strip()
+    text = (body.text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
 
-    voice = str(payload.get("voice") or TTS_VOICE)
-    style = str(payload.get("style") or TTS_STYLE)
+    voice = body.voice or TTS_VOICE
+    style = body.style if body.style is not None else TTS_STYLE
+
+    token = _vertex_access_token()
 
     body = {
         "contents": [{"parts": [{"text": style + text}]}],
@@ -351,12 +421,13 @@ async def narrate(job: str, index: int, request: Request) -> dict:
             "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}},
         },
     }
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{TTS_MODEL}:generateContent"
+    url = (f"https://{GCP_LOCATION}-aiplatform.googleapis.com/v1/projects/{GCP_PROJECT_ID}"
+           f"/locations/{GCP_LOCATION}/publishers/google/models/{TTS_MODEL}:generateContent")
 
     try:
         with httpx.Client(timeout=180.0) as client:
             r = client.post(url, json=body,
-                            headers={"x-goog-api-key": GEMINI_API_KEY,
+                            headers={"Authorization": f"Bearer {token}",
                                      "Content-Type": "application/json"})
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"TTS request failed: {e}")
@@ -401,7 +472,8 @@ async def narrate(job: str, index: int, request: Request) -> dict:
 # --------------------------------------------------------------------------
 
 @app.post("/assemble/{job}")
-def assemble(job: str, request: Request, allow_silent: int = 0) -> Response:
+def assemble(job: str, request: Request, allow_silent: int = 0,
+             allow_gaps: int = 0, expect: int = 0) -> Response:
     check_auth(request)
     sweep_old_jobs()
 
@@ -409,10 +481,24 @@ def assemble(job: str, request: Request, allow_silent: int = 0) -> Response:
     if not d.exists():
         raise HTTPException(status_code=404, detail=f"no such job {job}")
 
-    indices = sorted({int(p.stem) for p in d.glob("[0-9]*.mp4")} |
-                     {int(p.stem) for p in d.glob("[0-9]*.png")})
+    indices = segment_indices(d)
     if not indices:
         raise HTTPException(status_code=404, detail=f"no segments stored for job {job}")
+
+    # A missing segment is invisible in the output - the video just loses a
+    # story beat and nothing errors. Both checks below exist to make that loud.
+    if expect and len(indices) != expect:
+        raise HTTPException(
+            status_code=409,
+            detail=f"expected {expect} segments, found {len(indices)}: {indices}. "
+                   f"A generation step failed without stopping the run.")
+
+    gaps = [n for n in range(indices[-1] + 1) if n not in indices]
+    if gaps and not allow_gaps:
+        raise HTTPException(
+            status_code=409,
+            detail=f"segment indices are not contiguous, missing: {gaps}. "
+                   f"Re-run those segments, or pass ?allow_gaps=1 to render anyway.")
 
     missing = [i for i in indices if not (d / f"narr_{i:03d}.wav").exists()]
     if missing and not allow_silent:
