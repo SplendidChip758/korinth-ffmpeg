@@ -74,10 +74,15 @@ AMBIENT_VOLUME = os.environ.get("AMBIENT_VOLUME", "0.30")
 PAD_SECONDS = float(os.environ.get("PAD") or os.environ.get("PAD_SECONDS") or "0.4")
 OUT_FPS = int(os.environ.get("OUT_FPS", "25"))
 OUT_W, OUT_H = 1920, 1080
-# Imagen caps at 2K, so stills arrive ~2048x1152. Upscaling to 4K before
-# zoompan is what gives the Ken Burns move room to travel - cropping into a
-# 2K source for a 1080p output leaves only ~1.07x and goes soft immediately.
-WORK_W, WORK_H = 3840, 2160
+# zoompan positions its crop window on whole SOURCE pixels, so the source has
+# to be large enough that a slow move advances >1px per frame. At 3840 a 12%
+# zoom over 15s advances 0.55px/frame - it stalls, then jumps, and that
+# cadence is what reads as shake. 7680 puts it at ~1.1px/frame. (Imagen caps
+# at 2K, so stills arrive ~2048x1152 and this is always an upscale.)
+WORK_W, WORK_H = 7680, 4320
+# zoompan renders at 2x output; the final downscale blends the residual
+# whole-pixel step into a sub-pixel one.
+ZOOM_W, ZOOM_H = 3840, 2160
 
 # Vertex AI (service account), not the AI Studio API-key surface — GEAP's GCP
 # project only issues service account keys, not GEMINI_API_KEY values. The
@@ -299,13 +304,15 @@ async def json_body(request: Request) -> dict:
 
 def motion_filter(motion: str, frames: int) -> str:
     """
-    Ken Burns preset. Applied AFTER an upscale to 3840x2160, so the zoom always
-    crops into an oversized source and never has to invent detail.
+    Ken Burns preset. Applied AFTER an upscale to WORK_W x WORK_H, so the zoom
+    always crops into an oversized source and never has to invent detail, and
+    renders at ZOOM_W x ZOOM_H so the caller's downscale to output can turn the
+    residual whole-pixel step into a sub-pixel one.
     `on` is the output frame number; d must equal the total frame count.
     """
     f = max(frames, 2)
     centre = "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
-    tail = f":d={f}:s={OUT_W}x{OUT_H}:fps={OUT_FPS}"
+    tail = f":d={f}:s={ZOOM_W}x{ZOOM_H}:fps={OUT_FPS}"
 
     if motion == "zoom_out":
         return f"zoompan=z='max(1.12-0.12*on/{f},1.0)':{centre}{tail}"
@@ -324,7 +331,7 @@ def motion_filter(motion: str, frames: int) -> str:
     return f"zoompan=z='min(1+0.12*on/{f},1.12)':{centre}{tail}"
 
 
-VIDEO_ARGS = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+VIDEO_ARGS = ["-c:v", "libx264", "-preset", "slow", "-crf", "18",
               "-r", str(OUT_FPS), "-pix_fmt", "yuv420p",
               "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
 
@@ -588,8 +595,9 @@ def assemble(job: str, request: Request, allow_silent: int = 0,
             images += 1
             motion_file = d / f"{i:03d}.motion"
             motion = motion_file.read_text(encoding="utf-8").strip() if motion_file.exists() else "kenburns"
-            vf = (f"[0:v]scale={WORK_W}:{WORK_H}:flags=lanczos,"
-                  f"setsar=1,{motion_filter(motion, frames)}[v]")
+            vf = (f"[0:v]scale={WORK_W}:{WORK_H}:flags=lanczos,setsar=1,"
+                  f"{motion_filter(motion, frames)},"
+                  f"scale={OUT_W}:{OUT_H}:flags=lanczos[v]")
 
             cmd = ["ffmpeg", "-y", "-loop", "1", "-framerate", str(OUT_FPS),
                    "-t", f"{dur:.3f}", "-i", png.name]
