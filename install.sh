@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-REPO_URL="${KORINTH_REPO_URL:-git@github.com:youruser/korinth-ffmpeg.git}"
+REPO_URL="${KORINTH_REPO_URL:-git@github.com:SplendidChip758/korinth-ffmpeg.git}"
 REF="${KORINTH_REF:-main}"                 # branch, tag, or commit to deploy
 INSTALL_DIR="/opt/korinth-ffmpeg"
 ENV_FILE="/etc/korinth-ffmpeg.env"
