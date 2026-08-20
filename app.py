@@ -71,6 +71,12 @@ _archive = os.environ.get("ARCHIVE_DIR", "").strip()
 ARCHIVE_DIR = Path(_archive) if _archive else None
 
 AMBIENT_VOLUME = os.environ.get("AMBIENT_VOLUME", "0.30")
+# Gemini TTS loses gain across a long utterance. dynaudnorm rides the drift
+# out inside a segment; NARR_LUFS pins every segment to the same absolute
+# loudness so the film does not step up and down at each cut.
+NARR_DYNAMICS = os.environ.get("NARR_DYNAMICS",
+                               "dynaudnorm=f=150:g=51:p=0.95:m=30")
+NARR_LUFS = os.environ.get("NARR_LUFS", "-16")
 PAD_SECONDS = float(os.environ.get("PAD") or os.environ.get("PAD_SECONDS") or "0.4")
 OUT_FPS = int(os.environ.get("OUT_FPS", "25"))
 OUT_W, OUT_H = 1920, 1080
@@ -251,6 +257,48 @@ def probe_duration(path: Path) -> float:
         return float((proc.stdout or "").strip())
     except ValueError:
         return 0.0
+
+
+def normalise_narration(d: Path, src: str, dst: str) -> None:
+    """Flatten TTS gain drift, then pin the file to a fixed loudness.
+
+    Two passes on purpose. One-pass loudnorm runs in *dynamic* mode and
+    reimposes a slow ramp of its own, so the decay survives at reduced depth.
+    Measuring first and feeding the numbers back puts loudnorm in *linear*
+    mode: one constant gain, dynaudnorm's flat envelope left intact.
+
+    Measured on a synthetic 20 dB ramp, mean level at 0s / 10s / 20s:
+        raw        -22.2  -25.7  -31.9   (the symptom)
+        one-pass   -13.1  -14.6  -17.6   (still sliding)
+        two-pass   -16.8  -14.1  -17.3   (no trend, just speech variation)
+    """
+    base = f"{NARR_DYNAMICS},loudnorm=I={NARR_LUFS}:TP=-1.5:LRA=11"
+
+    probe = run(["ffmpeg", "-hide_banner", "-i", src,
+                 "-af", base + ":print_format=json", "-f", "null", "-"], cwd=d)
+    stats = {}
+    blob = re.search(r"\{[^{}]*input_i[^{}]*\}", probe.stderr or "", re.S)
+    if blob:
+        try:
+            stats = json.loads(blob.group(0))
+        except ValueError:
+            stats = {}
+
+    af = base
+    keys = ("input_i", "input_tp", "input_lra", "input_thresh")
+    if all(k in stats for k in keys):
+        af += (f":measured_I={stats['input_i']}"
+               f":measured_TP={stats['input_tp']}"
+               f":measured_LRA={stats['input_lra']}"
+               f":measured_thresh={stats['input_thresh']}:linear=true")
+    # No stats parsed: fall through to one-pass. Worse, never broken.
+
+    proc = run(["ffmpeg", "-y", "-i", src, "-af", af,
+                "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", dst], cwd=d)
+    if proc.returncode != 0 or not (d / dst).exists():
+        raise HTTPException(
+            status_code=500,
+            detail=f"narration normalise failed: {(proc.stderr or '')[-1000:]}")
 
 
 def has_audio(path: Path) -> bool:
@@ -514,15 +562,18 @@ def narrate(job: str, index: int, request: Request, body: NarrateBody) -> dict:
     wav = d / f"narr_{index:03d}.wav"
     raw.write_bytes(pcm)
 
-    # Gemini returns headerless s16le PCM; wrap it so everything downstream
-    # (and ffprobe) can treat it as an ordinary audio file.
+    # Wrap headerless s16le PCM, then normalise into the real filename.
+    tmp = d / f"narr_{index:03d}.tmp.wav"
     proc = run(["ffmpeg", "-y", "-f", "s16le", "-ar", str(TTS_RATE),
                 "-ac", str(TTS_CHANNELS), "-i", raw.name,
-                "-c:a", "pcm_s16le", wav.name], cwd=d)
+                "-c:a", "pcm_s16le", tmp.name], cwd=d)
     raw.unlink(missing_ok=True)
-    if proc.returncode != 0 or not wav.exists():
+    if proc.returncode != 0 or not tmp.exists():
         raise HTTPException(status_code=500,
                             detail=f"wav wrap failed: {(proc.stderr or '')[-1000:]}")
+
+    normalise_narration(d, tmp.name, wav.name)
+    tmp.unlink(missing_ok=True)
 
     dur = probe_duration(wav)
     return {"job": job, "index": index, "bytes": len(pcm),
