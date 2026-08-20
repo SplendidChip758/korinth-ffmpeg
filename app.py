@@ -361,6 +361,7 @@ def motion_filter(motion: str, frames: int) -> str:
     f = max(frames, 2)
     centre = "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
     tail = f":d={f}:s={ZOOM_W}x{ZOOM_H}:fps={OUT_FPS}"
+    tail = f":d={f}:s={ZOOM_W}x{ZOOM_H}:fps={OUT_FPS}"
 
     if motion == "zoom_out":
         return f"zoompan=z='max(1.12-0.12*on/{f},1.0)':{centre}{tail}"
@@ -379,6 +380,7 @@ def motion_filter(motion: str, frames: int) -> str:
     return f"zoompan=z='min(1+0.12*on/{f},1.12)':{centre}{tail}"
 
 
+VIDEO_ARGS = ["-c:v", "libx264", "-preset", "slow", "-crf", "18",
 VIDEO_ARGS = ["-c:v", "libx264", "-preset", "slow", "-crf", "18",
               "-r", str(OUT_FPS), "-pix_fmt", "yuv420p",
               "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]

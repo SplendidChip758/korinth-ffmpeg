@@ -127,6 +127,6 @@ venv/pip setup, check DNS/routing first — the real error is in that output.
 up as read-only-filesystem errors on the first `PUT` or `/assemble`, not at
 startup.
 
-Long-form stills are upscaled to 3840x2160 before `zoompan`. Imagen caps at 2K,
+Long-form stills are upscaled to 7680x4320 before `zoompan`. Imagen caps at 2K,
 and cropping a 2K source down to a 1080p output leaves only ~1.07x of travel —
 the move goes soft immediately without the upscale.
