@@ -29,7 +29,7 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
-ReadWritePaths=/var/lib/korinth-ffmpeg /mnt/korinth-out
+ReadWritePaths=/var/lib/korinth-ffmpeg -/mnt/korinth-industries/korinth-out
 
 [Install]
 WantedBy=multi-user.target
