@@ -197,6 +197,50 @@ journalctl -u korinth-ffmpeg -f
 curl -H "X-Auth-Token: $TOKEN" http://192.168.20.129:8080/health
 ```
 
+### Logs
+
+Everything goes to stdout, which systemd hands to journald. Boot writes one
+block naming every setting a failed render can be traced back to — version and
+SHA, ffmpeg, both directories and whether they are *writable*, auth on/off, the
+TTS config, and the preset table with its `loaded` flag. An unmounted share, an
+absent key file and a preset table that did not parse are all visible there,
+before the first request that would trip over them.
+
+Each line carries the id of the request that produced it, and the response
+returns it in `X-Request-Id`:
+
+```
+14:22:07.881 INFO    [4f1a9c] narrate ep42/003: 412 chars / 419 bytes, voice=Umbriel preset=narrator
+14:22:11.204 INFO    [4f1a9c] narrate ep42/003: TTS 200 in 3.3s, 412 KB RIFF
+14:22:12.017 INFO    [4f1a9c] narrate ep42/003 done: 11.842s of audio, 371 KB wav (4.1s total, 0.8s local)
+```
+
+n8n fires `/narrate` once per segment and `/assemble` logs a line per segment,
+so several renders interleave with nothing else to tell them apart. Pass
+`X-Request-Id` from n8n to make an execution's lines greppable by its own id;
+otherwise one is generated per request:
+
+```bash
+journalctl -u korinth-ffmpeg --since "20 min ago" | grep 4f1a9c
+```
+
+`LOG_LEVEL` (default `INFO`) is one or two lines per pipeline step. `DEBUG` adds
+every ffmpeg argv, every ffprobe result and the resolved style prompt — worth it
+for one reproduction run, not permanently. Two things are logged regardless of
+level because the output alone never reveals them: a substituted preset
+(`preset_substituted`), and a narration wav that measured 0.000s, which
+`/assemble` floors at 1.0s so the picture flashes past and the voiceover is cut
+off without anything erroring.
+
+Every ffmpeg failure is logged once, in `run()`, with the **full** stderr and
+the argv. The HTTP error bodies truncate to the last 1000–2000 characters and
+the line that explains a filter-graph failure is regularly above that cut; the
+argv is there because pasting it into a shell on the box is the fastest way to
+reproduce one. The auth token's value is never logged — a rejected request
+records only whether the header was absent or merely wrong, which is the whole
+diagnosis: absent means the n8n node lost its credential, wrong means a
+re-install regenerated the token and the credential was not updated.
+
 ## Known gotchas
 
 `apt-get update -qq` on this box hides network errors and looks like a hang, so
