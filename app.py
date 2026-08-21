@@ -13,6 +13,15 @@ LONG-FORM path (v4):
   PUT  /clip64/{job}/{index}      base64 mp4
   POST /narrate/{job}/{index}     text -> Gemini TTS -> wav, returns MEASURED duration
   POST /assemble/{job}            per-segment timing, Ken Burns, concat, mux
+  POST /assemble/{job}?background=1&deliver=path   -> 202, renders in a thread
+  GET  /assemble/{job}/status     running | done | failed
+
+Why assemble can run in the background (v4.7.0)
+  A full episode takes tens of minutes. As one long HTTP request, the caller's
+  timeout - not the render - decides whether the episode exists: n8n gave up at
+  30 minutes on a render that finished at 48 and reported a failure for a file
+  that was already on the share. background=1 returns immediately and the
+  caller polls, so no timeout anywhere is load-bearing.
 
   GET  /lastframe/{job}/{index}   last frame as base64 PNG (chaining, unused on GEAP)
   GET  /health · GET /jobs · DELETE /job/{job}
@@ -73,6 +82,15 @@ SERVICE_TOKEN = (os.environ.get("X_AUTH_TOKEN")
 MAX_JOB_AGE_SECONDS = int(os.environ.get("MAX_JOB_AGE_SECONDS", 6 * 60 * 60))
 MAX_CLIP_BYTES = int(os.environ.get("MAX_CLIP_BYTES", 200 * 1024 * 1024))
 FFMPEG_TIMEOUT = int(os.environ.get("FFMPEG_TIMEOUT", 1800))
+
+# Background /assemble bookkeeping. Underscore-prefixed so sweep_old_jobs()
+# skips it; it has to outlive the job directory it describes, because
+# deliver=path deletes that directory on success.
+ASSEMBLE_STATE_DIR = DATA_DIR / "_assemble"
+_assemble_lock = threading.Lock()
+# Identifies this process. A state file that still says "running" but carries a
+# different instance was orphaned by a restart - see /assemble/{job}/status.
+SERVICE_INSTANCE = f"{os.getpid()}-{int(time.time())}"
 
 # Finished episodes are copied here instead of vanishing with the job folder.
 # Unset = old behaviour (stream the bytes back, destroy everything).
@@ -455,6 +473,10 @@ def sweep_old_jobs() -> None:
         return
     for entry in DATA_DIR.iterdir():
         try:
+            # Underscore-prefixed directories are service state, not jobs.
+            # _assemble/ holds background render status and outlives every job.
+            if entry.name.startswith("_"):
+                continue
             if entry.is_dir() and now - entry.stat().st_mtime > MAX_JOB_AGE_SECONDS:
                 # Deleting someone's segments silently is how a slow pipeline
                 # looks like a pipeline that dropped work. Say what went and how
@@ -1037,11 +1059,13 @@ def narrate(job: str, index: int, request: Request, body: NarrateBody) -> dict:
 # assembly
 # --------------------------------------------------------------------------
 
-@app.post("/assemble/{job}")
-def assemble(job: str, request: Request, allow_silent: int = 0,
-             allow_gaps: int = 0, expect: int = 0, deliver: str = "file") -> Response:
-    check_auth(request)
-    sweep_old_jobs()
+def _assemble_core(job: str, allow_silent: int, allow_gaps: int, expect: int):
+    """Render every segment, concat, archive.
+
+    Returns (job_dir, final_name, payload, stats_headers). Delivery and cleanup
+    are the caller's problem, so the same code serves both the synchronous
+    endpoint and the background worker.
+    """
     assemble_started = time.monotonic()
 
     d = job_dir(job)
@@ -1053,8 +1077,8 @@ def assemble(job: str, request: Request, allow_silent: int = 0,
         raise HTTPException(status_code=404, detail=f"no segments stored for job {job}")
 
     log.info("assemble %s: %d segments %s (allow_silent=%d allow_gaps=%d "
-             "expect=%d deliver=%s)", job, len(indices), indices,
-             allow_silent, allow_gaps, expect, deliver)
+             "expect=%d)", job, len(indices), indices,
+             allow_silent, allow_gaps, expect)
 
     # A missing segment is invisible in the output - the video just loses a
     # story beat and nothing errors. Both checks below exist to make that loud.
@@ -1219,8 +1243,171 @@ def assemble(job: str, request: Request, allow_silent: int = 0,
     if archived:
         stats["X-Archive-Path"] = archived
 
+    payload = {
+        "job": job,
+        "path": archived,
+        "file": f"{job}.mp4",
+        "segments": len(parts),
+        "images": images,
+        "clips": videos,
+        "narrations": narrations,
+        "duration_seconds": round(total, 2),
+    }
+    return d, final, payload, stats
+
+
+# --------------------------------------------------------------------------
+# background assembly
+# --------------------------------------------------------------------------
+# A 14-segment render takes tens of minutes of wall clock. Held open as one
+# HTTP request, the CALLER'S timeout decides whether the episode exists: n8n
+# has given up at its 30 minute limit on a render that completed fine later,
+# reported a failure, and skipped the upload for a file that was already
+# sitting on the share. Nothing downstream could tell that apart from a real
+# render bug.
+#
+# Submit-and-poll removes the whole class: no request is open longer than it
+# takes to spawn a thread, and the caller asks about state instead of holding
+# a socket. Same shape as the Veo path in korinth-produce, which already
+# submits an operation and polls it.
+#
+# State is a file, not a dict, because a dict cannot tell you that the service
+# restarted mid-render - it just comes back empty and the render looks like it
+# never happened. The instance stamp turns that into an explicit failure.
+
+
+def _assemble_state_path(job: str) -> Path:
+    if not SAFE_JOB.match(job):
+        raise HTTPException(status_code=400, detail="invalid job id")
+    return ASSEMBLE_STATE_DIR / f"{job}.json"
+
+
+def _write_assemble_state(job: str, state: dict) -> None:
+    """Write atomically - a poller must never read a half-written state file."""
+    ASSEMBLE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    dest = _assemble_state_path(job)
+    tmp = dest.with_name(dest.name + ".part")
+    tmp.write_text(json.dumps(state), encoding="utf-8")
+    os.replace(tmp, dest)
+
+
+def _read_assemble_state(job: str) -> Optional[dict]:
+    dest = _assemble_state_path(job)
+    try:
+        return json.loads(dest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _assemble_worker(job: str, allow_silent: int, allow_gaps: int, expect: int) -> None:
+    started = time.monotonic()
+    try:
+        d, _final, payload, _stats = _assemble_core(job, allow_silent, allow_gaps, expect)
+        # The only log line naming the job dir before it goes: after this,
+        # the archived copy is the only one left.
+        log.info("assemble %s (background): returning a path pointer and "
+                 "deleting %s", job, d)
+        shutil.rmtree(d, ignore_errors=True)
+        _write_assemble_state(job, {
+            "state": "done",
+            "instance": SERVICE_INSTANCE,
+            "finished_at": time.time(),
+            "result": payload,
+        })
+        log.info("assemble %s (background) done in %.0fs", job,
+                 time.monotonic() - started)
+    except HTTPException as exc:
+        # The same 409/500 the synchronous route would have returned, kept as
+        # data so the poller gets the real reason instead of a bare "failed".
+        log.warning("assemble %s (background) failed after %.0fs: %s %s",
+                    job, time.monotonic() - started, exc.status_code, exc.detail)
+        _write_assemble_state(job, {
+            "state": "failed",
+            "instance": SERVICE_INSTANCE,
+            "finished_at": time.time(),
+            "status_code": exc.status_code,
+            "error": str(exc.detail),
+        })
+    except Exception as exc:  # noqa: BLE001 - a worker thread must not die silently
+        log.exception("assemble %s (background) crashed after %.0fs",
+                      job, time.monotonic() - started)
+        _write_assemble_state(job, {
+            "state": "failed",
+            "instance": SERVICE_INSTANCE,
+            "finished_at": time.time(),
+            "status_code": 500,
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+
+
+@app.post("/assemble/{job}")
+def assemble(job: str, request: Request, allow_silent: int = 0,
+             allow_gaps: int = 0, expect: int = 0, deliver: str = "file",
+             background: int = 0) -> Response:
+    """Assemble a job's segments into the finished episode.
+
+    background=0 (default) renders inline and returns the result, which is the
+    v4.6 behaviour and is fine for short jobs.
+
+    background=1 returns 202 immediately and renders in a thread; poll
+    GET /assemble/{job}/status until state is done or failed. Requires
+    deliver=path, because there is no open request left to stream bytes down.
+    """
+    check_auth(request)
+    sweep_old_jobs()
+
+    if background:
+        if deliver != "path":
+            raise HTTPException(
+                status_code=400,
+                detail="background=1 requires deliver=path - there is no open "
+                       "request to stream the file back on")
+        if ARCHIVE_DIR is None:
+            raise HTTPException(
+                status_code=400,
+                detail="background=1 needs ARCHIVE_DIR set in the service env")
+        # Cheap up-front checks so an obviously broken job fails on submit
+        # rather than looking healthy for 40 minutes.
+        d = job_dir(job)
+        if not d.exists():
+            raise HTTPException(status_code=404, detail=f"no such job {job}")
+
+        with _assemble_lock:
+            cur = _read_assemble_state(job)
+            if (cur and cur.get("state") == "running"
+                    and cur.get("instance") == SERVICE_INSTANCE):
+                log.info("assemble %s: background render already running, "
+                         "ignoring duplicate submit", job)
+                return JSONResponse(
+                    {"job": job, "state": "running",
+                     "detail": "an assemble is already running for this job",
+                     "status_url": f"/assemble/{job}/status"},
+                    status_code=202)
+            _write_assemble_state(job, {
+                "state": "running",
+                "instance": SERVICE_INSTANCE,
+                "started_at": time.time(),
+            })
+
+        log.info("assemble %s: submitted for background render "
+                 "(allow_silent=%d allow_gaps=%d expect=%d)", job,
+                 allow_silent, allow_gaps, expect)
+        threading.Thread(
+            target=_assemble_worker,
+            args=(job, allow_silent, allow_gaps, expect),
+            name=f"assemble-{job}",
+            daemon=True,
+        ).start()
+
+        return JSONResponse(
+            {"job": job, "state": "running",
+             "status_url": f"/assemble/{job}/status"},
+            status_code=202)
+
+    d, final, payload, stats = _assemble_core(job, allow_silent, allow_gaps, expect)
+
     if deliver == "path":
-        if archived is None:
+        if payload["path"] is None:
             raise HTTPException(
                 status_code=400,
                 detail="?deliver=path needs ARCHIVE_DIR set in the service env")
@@ -1229,19 +1416,7 @@ def assemble(job: str, request: Request, allow_silent: int = 0,
         log.info("assemble %s: returning a path pointer and deleting %s",
                  job, d)
         shutil.rmtree(d, ignore_errors=True)
-        return JSONResponse(
-            {
-                "job": job,
-                "path": archived,
-                "file": f"{job}.mp4",
-                "segments": len(parts),
-                "images": images,
-                "clips": videos,
-                "narrations": narrations,
-                "duration_seconds": round(total, 2),
-            },
-            headers=stats,
-        )
+        return JSONResponse(payload, headers=stats)
 
     data = (d / final).read_bytes()
     log.info("assemble %s: streaming %.1f MB back and deleting %s",
@@ -1253,6 +1428,38 @@ def assemble(job: str, request: Request, allow_silent: int = 0,
         headers={**stats,
                  "Content-Disposition": f'attachment; filename="{job}.mp4"'},
     )
+
+
+@app.get("/assemble/{job}/status")
+def assemble_status(job: str, request: Request) -> dict:
+    """Report a background assemble.
+
+    states: running | done | failed. `done` carries the same payload the
+    synchronous deliver=path route returns, so a caller can use it unchanged.
+    """
+    check_auth(request)
+    state = _read_assemble_state(job)
+    if state is None:
+        raise HTTPException(status_code=404,
+                            detail=f"no assemble has been submitted for job {job}")
+
+    # A "running" record stamped by a previous process means the service went
+    # down mid-render. Nothing is going to finish it, so say so rather than
+    # leaving the caller polling a job that no longer has a worker.
+    if state.get("state") == "running" and state.get("instance") != SERVICE_INSTANCE:
+        log.warning("assemble %s: status polled but the owning instance is "
+                    "gone (state instance=%s, current=%s)",
+                    job, state.get("instance"), SERVICE_INSTANCE)
+        return {
+            "job": job,
+            "state": "failed",
+            "status_code": 503,
+            "error": "the service restarted while this assemble was running; "
+                     "resubmit it",
+            "started_at": state.get("started_at"),
+        }
+
+    return {"job": job, **state}
 
 
 # --------------------------------------------------------------------------
