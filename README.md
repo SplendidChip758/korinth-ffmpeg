@@ -76,6 +76,68 @@ to keep in sync.
 The style instruction goes in `input.prompt`, a field of its own, so it is
 never read aloud as part of the narration.
 
+### TTS presets
+
+Voice and style come from a named preset table on the share rather than from
+env vars — a preset carries both fields together, so the pair cannot be
+half-changed into a read that does one job and not the other, and the rejected
+auditions keep their reasons. `korinth_tts_presets.py` owns the whole decision:
+the file, the mtime reload, the env fallback and the last-resort read. It is
+standard library only and imports nothing from `app.py`, so it can be exercised
+without the service running:
+
+```bash
+python korinth_tts_presets.py tts-presets.json
+```
+
+`tts-presets.json` in this repo is the master; copy it to
+`/mnt/korinth-industries/compiled/tts-presets.json` (or point
+`TTS_PRESETS_FILE` elsewhere). It is hand-written — a canon build populating
+`compiled/` must copy it through, not overwrite it. The service only reads it,
+re-reads it whenever the mtime changes, and keeps serving the last good copy if
+the file is mid-edit or briefly malformed: a typo in a voice prompt must not
+take narration down halfway through a fourteen-segment render.
+
+**One narrator, every episode, whoever the episode is about.** That is the
+`narrator` preset — Umbriel plus the locked style prompt. It is the only entry
+the loader can select; the five per-character candidates live under
+`_candidates`, which nothing reads, so none of them can go live by accident.
+Promoting one means moving it into `presets` *and* auditioning it first.
+
+Precedence, highest first:
+
+1. explicit `voice` / `style` in the request body — **per field**, which is what
+   makes auditioning cheap: hold the voice, vary the prompt
+2. the preset named by `preset` in the body, or the table's `default_preset`
+3. `TTS_VOICE` / `TTS_STYLE` from the env file — the pre-4.6.0 behaviour, so a
+   box whose share is down still sounds correct
+4. the locked read hardcoded in `korinth_tts_presets.py`
+
+An unknown preset name does **not** fail the request; it falls back to
+`default_preset`. Failing segment nine of fourteen because of a typo in a slug
+is a worse outcome than a consistent wrong narrator. But the substitution is
+visible rather than silent — `preset_substituted` is the field to alert on:
+
+```json
+{"duration_seconds": 11.84, "voice": "Umbriel", "preset": "narrator",
+ "preset_requested": null, "preset_substituted": false}
+```
+
+`preset_requested` is null when the caller expressed no preference, which
+includes the literal `"default"` that `korinth-produce` sends when the pending
+row has no `tts_preset` — treating that as a miss would raise the flag on
+ordinary calls and it would stop meaning anything.
+
+Switching the voice is the audio equivalent of model drift, and once episodes
+have aired it is worse than that: a narrator who changes voice mid-series is the
+one continuity error an audience notices without being told to look for it. Do
+it at an arc boundary or not at all.
+
+To roll back: delete `tts-presets.json` from the share. Resolution falls through
+to `TTS_VOICE` / `TTS_STYLE`, and failing those to the hardcoded locked read, so
+narration keeps working and keeps sounding the same. Nothing needs reverting in
+code.
+
 See `korinth-ffmpeg.env.example` for the exact setup steps. Until the key is
 in place the route returns 500; `/health` reports `tts_auth`, `tts_project` and
 `tts_configured` so this is visible without a test render.
@@ -94,10 +156,19 @@ writes both into the env file; `app.py` reads `KORINTH_VERSION` /
 `KORINTH_GIT_SHA` and reports them on `/health`:
 
 ```json
-{"status": "ok", "version": "4.5.0", "git_sha": "a1b2c3d", "ffmpeg": "6.1",
+{"status": "ok", "version": "4.6.0", "git_sha": "a1b2c3d", "ffmpeg": "6.1",
  "auth": true, "tts_configured": true, "tts_auth": "service-account",
- "tts_project": "korinth-industries", "tts_voice": "Orus"}
+ "tts_project": "korinth-industries",
+ "tts_presets": {"path": "/mnt/korinth-industries/compiled/tts-presets.json",
+                 "loaded": true, "mtime": 1755734400.0, "error": null,
+                 "count": 1, "names": ["narrator"], "default": "narrator",
+                 "schema_version": 1}}
 ```
+
+`tts_presets.loaded: false` with a non-null `error` means the table is not being
+used and narration is coming from `TTS_VOICE` / `TTS_STYLE` or the hardcoded
+read. That is a working service, not a broken one — but it is not the state you
+want to discover after a voice edit that appeared to do nothing.
 
 If the env vars are absent (running `app.py` by hand outside systemd) the
 version falls back to the `VERSION` file and the SHA reads `unknown`.
@@ -109,6 +180,9 @@ the only signal for which build is live.
 ## Repo layout
 
 - `app.py` — the service itself
+- `korinth_tts_presets.py` — narration voice resolution; stdlib only, no
+  dependency on `app.py`
+- `tts-presets.json` — master copy of the preset table; copied to the share
 - `requirements.txt`
 - `VERSION`
 - `korinth-ffmpeg.env.example` — template, copied once on first install

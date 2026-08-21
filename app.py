@@ -52,6 +52,8 @@ from pydantic import BaseModel
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import service_account
 
+import korinth_tts_presets as tts_presets
+
 BASE_DIR = Path(__file__).resolve().parent
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/var/lib/korinth-ffmpeg"))
@@ -107,16 +109,14 @@ TTS_ENDPOINT = os.environ.get(
     "TTS_ENDPOINT", "https://texttospeech.googleapis.com/v1/text:synthesize")
 TTS_LANGUAGE = os.environ.get("TTS_LANGUAGE", "en-US")
 TTS_MODEL = os.environ.get("TTS_MODEL", "gemini-3.1-flash-tts-preview")
-TTS_VOICE = os.environ.get("TTS_VOICE", "Orus")
-# No trailing ": " - synthesize takes the instruction as input.prompt, a field
-# of its own, so it is no longer concatenated onto the front of the narration.
-TTS_STYLE = os.environ.get(
-    "TTS_STYLE",
-    "Read this at a brisk, clipped pace, like a control-room log entry. "
-    "Cold, flat, professional. Do not linger or pause between sentences.",
-)
 TTS_RATE = 24000
 TTS_CHANNELS = 1
+
+# v4.6.0: voice and style come from the named preset table on the share.
+# korinth_tts_presets owns the whole decision - the file, the mtime reload, the
+# env fallback and the hardcoded locked read - so nothing here reads TTS_VOICE
+# or TTS_STYLE directly. Do not wrap `or` chains around resolve(); the
+# precedence lives in one place on purpose.
 
 
 def _version() -> str:
@@ -177,15 +177,23 @@ def _vertex_access_token() -> str:
     creds = _load_vertex_credentials()
     # Access tokens are short-lived; refresh() is a no-op if the cached one
     # still has enough lifetime left, so it's cheap to call on every request.
-    if not creds.valid:
-        with _vertex_lock:
-            if not creds.valid:
-                try:
-                    creds.refresh(GoogleAuthRequest())
-                except Exception as e:
-                    raise HTTPException(status_code=502,
-                                        detail=f"failed to refresh service account token: {e}")
-    return creds.token
+    #
+    # The validity check, the refresh and the token read all happen inside one
+    # lock. Reading creds.token outside it let a thread sample the credential
+    # while another was mid-refresh and come away with the expired value - the
+    # exact race the lock was added for. Holding it across the refresh also
+    # stops every waiting thread from firing its own refresh call.
+    #
+    # _load_vertex_credentials() takes this same lock, so it has to stay
+    # outside the block: threading.Lock is not reentrant.
+    with _vertex_lock:
+        if not creds.valid:
+            try:
+                creds.refresh(GoogleAuthRequest())
+            except Exception as e:
+                raise HTTPException(status_code=502,
+                                    detail=f"failed to refresh service account token: {e}")
+        return creds.token
 
 
 # --------------------------------------------------------------------------
@@ -203,6 +211,21 @@ def job_dir(job: str) -> Path:
     if not SAFE_JOB.match(job):
         raise HTTPException(status_code=400, detail="invalid job id")
     return DATA_DIR / job
+
+
+def check_index(index: int) -> int:
+    """Reject indices that would produce a file no other route can find.
+
+    Filenames are zero-padded to three digits, and segment_indices() only
+    matches bare numeric stems - so index 1000 writes `narr_1000.wav` and
+    index -1 writes `narr_-01.wav`, and /assemble then reports the segment as
+    unnarrated. Shared by every route that takes an index so the ingest and
+    narration paths cannot drift apart on what they accept, which is how the
+    asymmetry arose in the first place.
+    """
+    if index < 0 or index > 999:
+        raise HTTPException(status_code=400, detail="index out of range")
+    return index
 
 
 def sweep_old_jobs() -> None:
@@ -352,6 +375,15 @@ def segment_indices(d: Path) -> list:
 
 class NarrateBody(BaseModel):
     text: str = ""
+    # A separate field on purpose. Inferring the preset by sniffing whether
+    # `style` looks like a name would misresolve a one-word style prompt, which
+    # is a legitimate thing to audition, and that bug is invisible until
+    # playback.
+    # An unknown name is not an error: korinth_tts_presets.resolve substitutes
+    # default_preset and flags it, because failing a fourteen-segment render at
+    # segment nine over a typo in a slug is worse than a consistent wrong
+    # narrator.
+    preset: Optional[str] = None
     voice: Optional[str] = None
     style: Optional[str] = None
 
@@ -373,7 +405,6 @@ def motion_filter(motion: str, frames: int) -> str:
     """
     f = max(frames, 2)
     centre = "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
-    tail = f":d={f}:s={ZOOM_W}x{ZOOM_H}:fps={OUT_FPS}"
     tail = f":d={f}:s={ZOOM_W}x{ZOOM_H}:fps={OUT_FPS}"
 
     if motion == "zoom_out":
@@ -423,7 +454,11 @@ def health() -> dict:
         "tts_auth": "service-account" if TTS_CONFIGURED else "MISSING",
         "tts_project": gcp_project or None,
         "tts_model": TTS_MODEL,
-        "tts_voice": TTS_VOICE,
+        # health() never raises, and its mtime is how you tell which table is
+        # actually deployed - the same problem the version string solves for
+        # app.py. A table that failed to load reports `error` with `loaded:
+        # false` here rather than on the first render.
+        "tts_presets": tts_presets.health(),
         "gcp_project": gcp_project,
         "gcp_location": GCP_LOCATION,
         "archive_dir": str(ARCHIVE_DIR) if ARCHIVE_DIR else None,
@@ -454,8 +489,7 @@ def jobs(request: Request) -> dict:
 # --------------------------------------------------------------------------
 
 def _store(job: str, index: int, data: bytes, ext: str) -> dict:
-    if index < 0 or index > 999:
-        raise HTTPException(status_code=400, detail="index out of range")
+    check_index(index)
     d = job_dir(job)
     d.mkdir(parents=True, exist_ok=True)
     # Zero-padded so lexical order matches segment order.
@@ -518,9 +552,18 @@ def last_frame(job: str, index: int, request: Request) -> dict:
 @app.post("/narrate/{job}/{index}")
 def narrate(job: str, index: int, request: Request, body: NarrateBody) -> dict:
     """
-    Body (JSON): {"text": "...", "voice": "Orus" (optional), "style": "..." (optional)}
+    Body (JSON):
+      {"text":   "...",              required
+       "preset": "narrator",         optional - name from tts-presets.json
+       "voice":  "Umbriel",          optional - overrides the preset's voice
+       "style":  "Read this as ..."} optional - overrides the preset's style
+
     Generates the segment's voiceover via Gemini TTS, writes it as a wav in the
     job directory, and returns its MEASURED duration.
+
+    voice and style override the preset per field, which is what lets
+    korinth-audition.sh drive this endpoint directly instead of calling Google
+    itself, so an audition follows whatever auth the service is using.
 
     Deliberately a sync def: this makes a blocking HTTP call and then shells out
     to ffmpeg. As `async def` both of those stall the event loop for the whole
@@ -528,6 +571,7 @@ def narrate(job: str, index: int, request: Request, body: NarrateBody) -> dict:
     in FastAPI's threadpool instead, which is also what /assemble does.
     """
     check_auth(request)
+    check_index(index)
 
     text = (body.text or "").strip()
     if not text:
@@ -542,8 +586,12 @@ def narrate(job: str, index: int, request: Request, body: NarrateBody) -> dict:
                    f"input.text at 4000. Raise the segment count in Split "
                    f"Narration so chunks are smaller.")
 
-    voice = body.voice or TTS_VOICE
-    style = body.style if body.style is not None else TTS_STYLE
+    # One call, one place. resolve() already implements the whole precedence
+    # (explicit fields, then the named preset, then TTS_VOICE / TTS_STYLE, then
+    # the hardcoded locked read), so there is deliberately no `or` chain here.
+    sel = tts_presets.resolve(preset=body.preset, voice=body.voice,
+                              style=body.style)
+    voice, style = sel["voice"], sel["style"]
 
     token = _vertex_access_token()
 
@@ -609,8 +657,28 @@ def narrate(job: str, index: int, request: Request, body: NarrateBody) -> dict:
     tmp.unlink(missing_ok=True)
 
     dur = probe_duration(wav)
-    return {"job": job, "index": index, "bytes": len(pcm),
-            "voice": voice, "duration_seconds": round(dur, 3)}
+    # The resolved voice goes back on every response so the caller can stamp it
+    # on the plan and the story log. When episode 30 sounds different from
+    # episode 12, this is what says whether the preset changed or the model
+    # drifted - otherwise unrecoverable, and it costs three fields.
+    #
+    # preset_substituted is the one to alert on: it means a name was asked for
+    # and something else was used. The substitution is deliberate, but it must
+    # not be silent.
+    #
+    # Not `**sel` - the style prose would be echoed on every segment, and
+    # sel["model"] is documentation, not what was sent. TTS_MODEL is what
+    # actually populated modelName above.
+    #
+    # bytes is the normalised wav on disk, which is what the next stage reads.
+    # It used to report len(pcm) - the raw API payload before wav wrapping and
+    # two-pass normalisation - so the two numbers are kept apart by name.
+    return {"job": job, "index": index,
+            "bytes": wav.stat().st_size, "tts_bytes": len(pcm),
+            "duration_seconds": round(dur, 3),
+            "voice": sel["voice"], "preset": sel["preset"],
+            "preset_requested": sel["preset_requested"],
+            "preset_substituted": sel["preset_substituted"]}
 
 
 # --------------------------------------------------------------------------

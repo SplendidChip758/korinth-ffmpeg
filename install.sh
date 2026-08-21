@@ -34,7 +34,7 @@ id -u "${APP_USER}" >/dev/null 2>&1 \
 
 mkdir -p "${INSTALL_DIR}" "${DATA_DIR}" /etc/korinth-ffmpeg
 
-# The service account key for Vertex AI (POST /narrate) is dropped here by
+# The service account key for Cloud Text-to-Speech (POST /narrate) is dropped here by
 # hand — install.sh has no way to obtain it. If it's already present, keep its
 # permissions correct on every re-run.
 if [ -f /etc/korinth-ffmpeg/service-account.json ]; then
@@ -73,6 +73,13 @@ if [ ! -f "${ENV_FILE}" ]; then
 else
   echo "-> env file exists, leaving token untouched"
 fi
+
+# v4.6.0 deliberately does NOT migrate TTS_VOICE / TTS_STYLE out of the env
+# file. They are no longer where the voice normally comes from, but they are
+# still the layer that answers when the share is down, and deleting them is
+# what would make an unreachable table sound wrong instead of sounding
+# unchanged. Leaving them also keeps the documented rollback (remove
+# tts-presets.json from the share) a one-step operation.
 
 # Persist version info alongside the rest of the env so app.py can read it
 # without needing systemd Environment= edits on every deploy
@@ -132,7 +139,12 @@ echo "   Base URL    http://${IP:-<this-lxc-ip>}:8080"
 echo "   Header      X-Auth-Token"
 echo "   Token       ${TOKEN_VALUE}"
 echo
-echo " POST /narrate needs a Vertex AI service account key at"
-echo " /etc/korinth-ffmpeg/service-account.json, and GCP_PROJECT_ID set in"
-echo " ${ENV_FILE}. See korinth-ffmpeg.env.example for setup steps."
+echo " POST /narrate needs a service account key at"
+echo " /etc/korinth-ffmpeg/service-account.json (Cloud Text-to-Speech), and"
+echo " reads its narration voice from"
+echo " /mnt/korinth-industries/compiled/tts-presets.json — copy"
+echo " tts-presets.json from this repo if the share has none yet. Without it,"
+echo " narration falls back to TTS_VOICE / TTS_STYLE and then to the locked"
+echo " read compiled into korinth_tts_presets.py, so it still sounds right."
+echo " See korinth-ffmpeg.env.example for setup steps."
 echo "======================================================================"

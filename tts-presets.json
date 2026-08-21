@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "updated": "2026-08-21",
+
+  "_comment": [
+    "Named narration voices for korinth-ffmpeg >= 4.6.0.",
+    "",
+    "DECIDED 2026-08-21: the channel uses ONE narrator, for every episode,",
+    "regardless of whose account the episode is. That is the 'narrator' preset",
+    "below - Umbriel plus the locked style prompt, chosen by auditioning all 16",
+    "male Gemini voices unprompted and then nine style prompts against the",
+    "shortlist. It is the only entry the service can select.",
+    "",
+    "Per-character voices were considered and set aside. The five candidates",
+    "that work implied are kept under _candidates so the thinking is not lost,",
+    "but the loader only ever reads 'presets', so nothing there can be selected",
+    "by accident. Promoting one means moving it into 'presets' AND auditioning",
+    "it first - none of them has been heard.",
+    "",
+    "style is written as BEHAVIOUR, never as adjectives about a character.",
+    "The voice supplies the timbre and the prompt supplies the intent, and",
+    "neither has to do both jobs. That division is why the Umbriel read works:",
+    "an easy-going voice given a grave instruction, rather than a grave voice",
+    "trying to also sound like a person."
+  ],
+
+  "default_preset": "narrator",
+  "model": "gemini-3.1-flash-tts-preview",
+  "fallback_model": "gemini-2.5-flash-tts",
+
+  "_model_note": [
+    "DOCUMENTATION ONLY. Neither key below selects anything.",
+    "",
+    "app.py sends modelName from the TTS_MODEL environment variable, and",
+    "reports it as /health.tts_model. Editing 'model' here changes nothing -",
+    "if you want a different model, set TTS_MODEL in /etc/korinth-ffmpeg.env.",
+    "They are recorded here so the file says which model its style prompts",
+    "were written against, which is not the same question as which model is",
+    "running.",
+    "",
+    "gemini-3.1-flash-tts-preview is current generation and preview-only.",
+    "As of 2026-08-21 gemini-2.5-flash-tts is GA, so unlike when this pipeline",
+    "was built there is now a stable model to land on when the preview id is",
+    "retired. That swap is a TTS_MODEL edit, not a change to this file."
+  ],
+
+  "presets": {
+    "narrator": {
+      "voice": "Umbriel",
+      "style": "Read this as someone recounting a case they worked. Deliberate and grounded, quietly gripping, the pacing of a story being told rather than a report being read. Serious throughout, never theatrical. ",
+      "auditioned": true,
+      "notes": "LOCKED. The channel's voice. Umbriel is Google's easy-going voice; the prompt supplies the gravity. The archivist register was rejected as funereal - the dread here comes from corporate calm, not a hushed read. Do not change without re-auditioning, and do not change at all once episodes have aired: a narrator who changes voice mid-series is the one continuity error an audience notices without being told to look for it."
+    }
+  },
+
+  "_candidates": {
+    "_note": [
+      "NOT SELECTABLE. The loader reads 'presets' only. None of these has been",
+      "auditioned - each voice was picked to be distinct and plausible, not",
+      "because it was heard. If per-character narration is ever revisited, run",
+      "korinth-audition.sh per character before promoting anything."
+    ],
+    "elias-rourke": {
+      "voice": "Rasalgethi",
+      "style": "Read this the way someone explains a thing they have explained many times to people who did not listen the first time. Unhurried, matter-of-fact, faintly worn. Let the pauses fall where a person stops to decide how much to say. Serious throughout, never theatrical. ",
+      "notes": "Chief Maintenance Engineer, decades with Korinth, Daniel's mentor. Older and steadier than Daniel without sounding tired."
+    },
+    "mara-venn": {
+      "voice": "Kore",
+      "style": "Read this as an account being given to someone senior, by a person who has already decided what they are willing to say. Controlled, economical, professionally calm. The care is in the precision, not in the warmth. Serious throughout, never theatrical. ",
+      "notes": "Operations Superintendent. The human face of the system. Competence, not coldness."
+    },
+    "lena-orlov": {
+      "voice": "Despina",
+      "style": "Read this as someone choosing each sentence because the next one would say too much. Measured, quiet, slightly held back. Let the sentences that state facts land flatter than the ones that do not. Serious throughout, never theatrical. ",
+      "notes": "Systems Architect / AI Specialist. Knows more than she admits. The restraint is the character."
+    },
+    "tamsin-vale": {
+      "voice": "Autonoe",
+      "style": "Read this as someone walking back through numbers that stopped adding up, out loud, to themselves. Attentive and a little dry, gathering pace where the pattern gets clearer. Serious throughout, never theatrical. ",
+      "notes": "Cargo Operations Controller. Should feel like noticing, not like accusing."
+    },
+    "adrian-kess": {
+      "voice": "Iapetus",
+      "style": "Read this as a statement given by someone who knows it will be read by people looking for a reason to blame them. Plain, sequential, nothing embellished. No defensiveness in the delivery - the flatness is the defence. Serious throughout, never theatrical. ",
+      "notes": "Corporate Security Officer. Should not read as a villain."
+    }
+  }
+}
