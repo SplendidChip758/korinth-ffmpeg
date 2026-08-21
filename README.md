@@ -62,17 +62,23 @@ systemd unit, restart, confirm via `/health`. It never touches
 the n8n Header Auth credential. Run it as root; a bare LXC needs nothing done
 to it by hand first.
 
-`POST /narrate` calls Gemini on **Vertex AI**, authenticated as a service
-account — GEAP's GCP project issues service account keys, not AI Studio
-`GEMINI_API_KEY` values. It needs one thing: a service account JSON key
-(role: Vertex AI User) at `/etc/korinth-ffmpeg/service-account.json`, placed
-by hand — the installer has no way to generate one. The project id is read
-straight out of the key file's own `project_id` field, so there's no separate
-project config to keep in sync.
+`POST /narrate` calls Gemini TTS on **Cloud Text-to-Speech**, authenticated as
+a service account — GEAP's GCP project issues service account keys, not AI
+Studio `GEMINI_API_KEY` values. It needs two things: the API enabled
+(`gcloud services enable texttospeech.googleapis.com`) and a service account
+JSON key at `/etc/korinth-ffmpeg/service-account.json`, placed by hand — the
+installer has no way to generate one. The account needs
+`roles/serviceusage.serviceUsageConsumer`, which is what makes the
+`x-goog-user-project` billing header legal. The project id is read straight out
+of the key file's own `project_id` field, so there's no separate project config
+to keep in sync.
+
+The style instruction goes in `input.prompt`, a field of its own, so it is
+never read aloud as part of the narration.
 
 See `korinth-ffmpeg.env.example` for the exact setup steps. Until the key is
-in place the route returns 500; `/health` reports `tts_configured` and
-`gcp_project` so this is visible without a test render.
+in place the route returns 500; `/health` reports `tts_auth`, `tts_project` and
+`tts_configured` so this is visible without a test render.
 
 To deploy a specific tag/commit instead of `main`:
 
@@ -88,8 +94,9 @@ writes both into the env file; `app.py` reads `KORINTH_VERSION` /
 `KORINTH_GIT_SHA` and reports them on `/health`:
 
 ```json
-{"status": "ok", "version": "4.0.0", "git_sha": "a1b2c3d", "ffmpeg": "6.1",
- "auth": true, "tts_configured": true, "tts_voice": "Orus"}
+{"status": "ok", "version": "4.5.0", "git_sha": "a1b2c3d", "ffmpeg": "6.1",
+ "auth": true, "tts_configured": true, "tts_auth": "service-account",
+ "tts_project": "korinth-industries", "tts_voice": "Orus"}
 ```
 
 If the env vars are absent (running `app.py` by hand outside systemd) the

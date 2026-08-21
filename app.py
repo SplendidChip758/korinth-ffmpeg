@@ -90,20 +90,30 @@ WORK_W, WORK_H = 7680, 4320
 # whole-pixel step into a sub-pixel one.
 ZOOM_W, ZOOM_H = 3840, 2160
 
-# Vertex AI (service account), not the AI Studio API-key surface — GEAP's GCP
-# project only issues service account keys, not GEMINI_API_KEY values. The
-# project id lives in the key file itself, so GCP_PROJECT_ID is only needed to
-# override it (e.g. calling Vertex in a different project than the one that
-# issued the key) — leave it unset in the normal case.
+# Service account, not the AI Studio API-key surface — GEAP's GCP project only
+# issues service account keys, not GEMINI_API_KEY values. The project id lives
+# in the key file itself, so GCP_PROJECT_ID is only needed to override it (e.g.
+# billing a different project than the one that issued the key) — leave it
+# unset in the normal case. GCP_PROJECT is accepted as an alias because that is
+# the name the v4.5.0 rollout note used.
 GOOGLE_APPLICATION_CREDENTIALS = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "").strip()
+GCP_PROJECT_ID = (os.environ.get("GCP_PROJECT_ID")
+                  or os.environ.get("GCP_PROJECT", "")).strip()
+# Narration moved off Vertex AI's generateContent onto Cloud Text-to-Speech in
+# v4.5.0, and text:synthesize is a global endpoint - so GCP_LOCATION no longer
+# selects anything. Kept because /health reports it and the env file sets it.
 GCP_LOCATION = os.environ.get("GCP_LOCATION", "us-central1").strip()
+TTS_ENDPOINT = os.environ.get(
+    "TTS_ENDPOINT", "https://texttospeech.googleapis.com/v1/text:synthesize")
+TTS_LANGUAGE = os.environ.get("TTS_LANGUAGE", "en-US")
 TTS_MODEL = os.environ.get("TTS_MODEL", "gemini-3.1-flash-tts-preview")
 TTS_VOICE = os.environ.get("TTS_VOICE", "Orus")
+# No trailing ": " - synthesize takes the instruction as input.prompt, a field
+# of its own, so it is no longer concatenated onto the front of the narration.
 TTS_STYLE = os.environ.get(
     "TTS_STYLE",
     "Read this at a brisk, clipped pace, like a control-room log entry. "
-    "Cold, flat, professional. Do not linger or pause between sentences: ",
+    "Cold, flat, professional. Do not linger or pause between sentences.",
 )
 TTS_RATE = 24000
 TTS_CHANNELS = 1
@@ -133,6 +143,9 @@ app = FastAPI(title="Korinth ffmpeg service", version=VERSION)
 # start and serve every other route; /narrate is what surfaces the error.
 # /narrate is a sync endpoint, so FastAPI runs it in a threadpool and two
 # requests really can land here at once - hence the lock.
+# The _vertex_* names are historical: the credential is scoped to
+# cloud-platform, so the same token authenticates Cloud Text-to-Speech now that
+# narration no longer goes to Vertex AI.
 _vertex_credentials = None
 _vertex_project_id = GCP_PROJECT_ID or None
 _vertex_lock = threading.Lock()
@@ -381,7 +394,6 @@ def motion_filter(motion: str, frames: int) -> str:
 
 
 VIDEO_ARGS = ["-c:v", "libx264", "-preset", "slow", "-crf", "18",
-VIDEO_ARGS = ["-c:v", "libx264", "-preset", "slow", "-crf", "18",
               "-r", str(OUT_FPS), "-pix_fmt", "yuv420p",
               "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
 
@@ -407,6 +419,9 @@ def health() -> dict:
         "ffprobe": "ok" if shutil.which("ffprobe") else "NOT FOUND",
         "auth": bool(SERVICE_TOKEN),
         "tts_configured": TTS_CONFIGURED,
+        # So a broken credential is visible without a test render.
+        "tts_auth": "service-account" if TTS_CONFIGURED else "MISSING",
+        "tts_project": gcp_project or None,
         "tts_model": TTS_MODEL,
         "tts_voice": TTS_VOICE,
         "gcp_project": gcp_project,
@@ -517,30 +532,42 @@ def narrate(job: str, index: int, request: Request, body: NarrateBody) -> dict:
     text = (body.text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
+    n_bytes = len(text.encode("utf-8"))
+    if n_bytes > 4000:
+        # The API's own cap. Failing here names the real problem; the API
+        # returns a 400 that does not mention which field was too long.
+        raise HTTPException(
+            status_code=400,
+            detail=f"segment text is {n_bytes} bytes; the synthesize API caps "
+                   f"input.text at 4000. Raise the segment count in Split "
+                   f"Narration so chunks are smaller.")
 
     voice = body.voice or TTS_VOICE
     style = body.style if body.style is not None else TTS_STYLE
 
     token = _vertex_access_token()
 
-    body = {
-        # Vertex AI's generateContent rejects a content entry with no role
-        # ("Please use a valid role: user, model.") - the AI Studio endpoint
-        # this was ported from defaults it, Vertex doesn't.
-        "contents": [{"role": "user", "parts": [{"text": style + text}]}],
-        "generationConfig": {
-            "responseModalities": ["AUDIO"],
-            "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}},
-        },
+    payload = {
+        # prompt and text are separate fields, so the style instruction cannot
+        # be read aloud the way it could when it was concatenated on the front.
+        "input": {"prompt": style, "text": text},
+        "voice": {"languageCode": TTS_LANGUAGE, "name": voice,
+                  "modelName": TTS_MODEL},
+        "audioConfig": {"audioEncoding": "LINEAR16",
+                        "sampleRateHertz": TTS_RATE},
     }
-    url = (f"https://{GCP_LOCATION}-aiplatform.googleapis.com/v1/projects/{_vertex_project_id}"
-           f"/locations/{GCP_LOCATION}/publishers/google/models/{TTS_MODEL}:generateContent")
+    headers = {"Authorization": f"Bearer {token}",
+               "Content-Type": "application/json"}
+    # Pins quota and billing to our project rather than to whichever project
+    # the credential happens to belong to. Needs
+    # roles/serviceusage.serviceUsageConsumer on that project, or the call 403s
+    # with a message about the caller that reads like a TTS permission problem.
+    if _vertex_project_id:
+        headers["x-goog-user-project"] = _vertex_project_id
 
     try:
         with httpx.Client(timeout=180.0) as client:
-            r = client.post(url, json=body,
-                            headers={"Authorization": f"Bearer {token}",
-                                     "Content-Type": "application/json"})
+            r = client.post(TTS_ENDPOINT, json=payload, headers=headers)
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"TTS request failed: {e}")
 
@@ -549,8 +576,8 @@ def narrate(job: str, index: int, request: Request, body: NarrateBody) -> dict:
                             detail=f"TTS returned {r.status_code}: {r.text[:400]}")
 
     try:
-        b64 = r.json()["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
-    except (KeyError, IndexError, ValueError):
+        b64 = r.json()["audioContent"]
+    except (KeyError, ValueError):
         raise HTTPException(status_code=502,
                             detail=f"unexpected TTS response: {r.text[:400]}")
 
@@ -560,19 +587,23 @@ def narrate(job: str, index: int, request: Request, body: NarrateBody) -> dict:
 
     d = job_dir(job)
     d.mkdir(parents=True, exist_ok=True)
-    raw = d / f"narr_{index:03d}.raw"
     wav = d / f"narr_{index:03d}.wav"
-    raw.write_bytes(pcm)
-
-    # Wrap headerless s16le PCM, then normalise into the real filename.
     tmp = d / f"narr_{index:03d}.tmp.wav"
-    proc = run(["ffmpeg", "-y", "-f", "s16le", "-ar", str(TTS_RATE),
-                "-ac", str(TTS_CHANNELS), "-i", raw.name,
-                "-c:a", "pcm_s16le", tmp.name], cwd=d)
-    raw.unlink(missing_ok=True)
-    if proc.returncode != 0 or not tmp.exists():
-        raise HTTPException(status_code=500,
-                            detail=f"wav wrap failed: {(proc.stderr or '')[-1000:]}")
+
+    # LINEAR16 comes back as a RIFF/WAV file. Handle bare PCM too, so a change
+    # of audioEncoding default cannot silently produce noise.
+    if pcm[:4] == b"RIFF":
+        tmp.write_bytes(pcm)
+    else:
+        raw = d / f"narr_{index:03d}.raw"
+        raw.write_bytes(pcm)
+        proc = run(["ffmpeg", "-y", "-f", "s16le", "-ar", str(TTS_RATE),
+                    "-ac", str(TTS_CHANNELS), "-i", raw.name,
+                    "-c:a", "pcm_s16le", tmp.name], cwd=d)
+        raw.unlink(missing_ok=True)
+        if proc.returncode != 0 or not tmp.exists():
+            raise HTTPException(status_code=500,
+                                detail=f"wav wrap failed: {(proc.stderr or '')[-1000:]}")
 
     normalise_narration(d, tmp.name, wav.name)
     tmp.unlink(missing_ok=True)
