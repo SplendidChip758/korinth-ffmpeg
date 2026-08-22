@@ -14,7 +14,7 @@ LONG-FORM path (v4):
   POST /narrate/{job}/{index}     text -> Gemini TTS -> wav, returns MEASURED duration
   POST /assemble/{job}            per-segment timing, Ken Burns, concat, mux
   POST /assemble/{job}?background=1&deliver=path   -> 202, renders in a thread
-  GET  /assemble/{job}/status     running | done | failed
+  GET  /assemble/{job}/status     running | done | failed  (diagnostic only)
 
 Why assemble can run in the background (v4.7.0)
   A full episode takes tens of minutes. As one long HTTP request, the caller's
@@ -22,6 +22,18 @@ Why assemble can run in the background (v4.7.0)
   30 minutes on a render that finished at 48 and reported a failure for a file
   that was already on the share. background=1 returns immediately and the
   caller polls, so no timeout anywhere is load-bearing.
+
+Why the render calls back instead of being polled (v4.8.0)
+  n8n no longer polls /assemble/{job}/status. When a background render reaches
+  a terminal state, the service POSTs it to CALLBACK_URL (or callback_url in
+  the submit body) and retries with backoff, from the state file rather than
+  from the render thread, until it gets a 2xx. That file also survives a
+  restart: at startup, any render still "running" under an instance that no
+  longer exists is promoted to failed and its callback is fired, so an OOM
+  mid-render is reported the moment the service comes back rather than on
+  whatever poll would eventually have caught it. background=1 is refused at
+  submit if no callback target is configured - a render nobody can hear from
+  is worse than one that never started.
 
   GET  /lastframe/{job}/{index}   last frame as base64 PNG (chaining, unused on GEAP)
   GET  /health · GET /jobs · DELETE /job/{job}
@@ -83,11 +95,31 @@ MAX_JOB_AGE_SECONDS = int(os.environ.get("MAX_JOB_AGE_SECONDS", 6 * 60 * 60))
 MAX_CLIP_BYTES = int(os.environ.get("MAX_CLIP_BYTES", 200 * 1024 * 1024))
 FFMPEG_TIMEOUT = int(os.environ.get("FFMPEG_TIMEOUT", 1800))
 
+# Where a finished background render reports to. n8n no longer polls, so a
+# render with no callback target finishes into silence - see the fail-closed
+# check in assemble().
+CALLBACK_URL = os.environ.get("CALLBACK_URL", "").strip()
+CALLBACK_TOKEN = os.environ.get("CALLBACK_TOKEN", "").strip()
+CALLBACK_TIMEOUT = float(os.environ.get("CALLBACK_TIMEOUT", "30"))
+# The notifier wakes on this interval to retry whatever did not land. It is a
+# stat() of one local directory, not a workflow execution - the thing that was
+# actually costing something.
+CALLBACK_TICK = float(os.environ.get("CALLBACK_TICK", "5"))
+CALLBACK_BACKOFF_MAX = float(os.environ.get("CALLBACK_BACKOFF_MAX", "300"))
+# After this long a callback stops being retried and starts being an alert.
+CALLBACK_MAX_AGE_SECONDS = int(os.environ.get("CALLBACK_MAX_AGE_SECONDS", 24 * 60 * 60))
+# Terminal state files are never swept today (sweep_old_jobs skips the whole
+# underscore dir), so _assemble/ grows one file per episode forever.
+STATE_RETENTION_SECONDS = int(os.environ.get("STATE_RETENTION_SECONDS", 7 * 24 * 60 * 60))
+
 # Background /assemble bookkeeping. Underscore-prefixed so sweep_old_jobs()
 # skips it; it has to outlive the job directory it describes, because
 # deliver=path deletes that directory on success.
 ASSEMBLE_STATE_DIR = DATA_DIR / "_assemble"
 _assemble_lock = threading.Lock()
+_notify_inflight: set = set()
+_notify_lock = threading.Lock()
+_notify_stop = threading.Event()
 # Identifies this process. A state file that still says "running" but carries a
 # different instance was orphaned by a restart - see /assemble/{job}/status.
 SERVICE_INSTANCE = f"{os.getpid()}-{int(time.time())}"
@@ -106,6 +138,29 @@ NARR_DYNAMICS = os.environ.get("NARR_DYNAMICS",
 NARR_LUFS = os.environ.get("NARR_LUFS", "-16")
 PAD_SECONDS = float(os.environ.get("PAD") or os.environ.get("PAD_SECONDS") or "0.4")
 OUT_FPS = int(os.environ.get("OUT_FPS", "25"))
+
+# ffmpeg parallelises its filtergraph across threads, and EACH in-flight thread
+# holds its own copy of the frame. At the 8K work canvas that is ~100 MB per
+# rgb24 frame in scale plus ~50 MB per yuv420p frame after it, so the default
+# (one thread per core) is what turns a single segment into gigabytes.
+#
+# Measured on LXC 429, 2026-08-21: an OOM kill at 3.9 GB with ~13 ffmpeg worker
+# threads live, on the FIRST segment of the render - the box could not fit one
+# segment, never mind fourteen. Capping the filtergraph at a couple of threads
+# cuts that roughly linearly.
+#
+# This does not change a single output pixel: it is how many frames are worked
+# on at once, not how they are rendered. The 8K canvas and the 2x zoompan
+# render are the 4.3.0 anti-stutter fix and are deliberately untouched.
+#
+# 0 = do not pass the flag, let ffmpeg decide (the pre-4.7 behaviour).
+FILTER_THREADS = int(os.environ.get("FILTER_THREADS", "2"))
+# Global options, so they belong before the inputs. Both spellings are set:
+# -filter_threads covers -vf, -filter_complex_threads covers -filter_complex,
+# and /assemble uses the latter.
+FILTER_THREAD_ARGS = ([] if FILTER_THREADS <= 0 else
+                      ["-filter_threads", str(FILTER_THREADS),
+                       "-filter_complex_threads", str(FILTER_THREADS)])
 OUT_W, OUT_H = 1920, 1080
 # zoompan positions its crop window on whole SOURCE pixels, so the source has
 # to be large enough that a slow move advances >1px per frame. At 3840 a 12%
@@ -273,12 +328,29 @@ def _log_startup() -> None:
              AMBIENT_VOLUME, NARR_LUFS, NARR_DYNAMICS)
     log.info("  video out=%dx%d@%dfps work=%dx%d zoom=%dx%d pad=%ss",
              OUT_W, OUT_H, OUT_FPS, WORK_W, WORK_H, ZOOM_W, ZOOM_H, PAD_SECONDS)
+    # The setting most likely to be the difference between a render and an OOM
+    # on a small box, so it is read back with the rest of the video config.
+    log.info("  filter_threads=%s%s", FILTER_THREADS or "unset (ffmpeg default)",
+             "" if FILTER_THREADS else
+             " - uncapped filtergraph threading at an 8K canvas is what OOM-killed this service on 2026-08-21")
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     _log_startup()
+    promoted = _promote_orphans()
+    log.info("  callback url=%s auth=%s tick=%.0fs timeout=%.0fs "
+             "give_up_after=%.0fh (promoted %d orphaned render(s))",
+             CALLBACK_URL or "NOT SET", bool(CALLBACK_TOKEN),
+             CALLBACK_TICK, CALLBACK_TIMEOUT,
+             CALLBACK_MAX_AGE_SECONDS / 3600, promoted)
+    if not CALLBACK_URL:
+        log.warning("  CALLBACK_URL is unset - background renders will be "
+                    "refused at submit, because nothing polls this service")
+    threading.Thread(target=_notifier_loop, name="callback-notifier",
+                     daemon=True).start()
     yield
+    _notify_stop.set()
     log.info("korinth-ffmpeg %s shutting down", VERSION)
 
 
@@ -696,6 +768,16 @@ class NarrateBody(BaseModel):
     preset: Optional[str] = None
     voice: Optional[str] = None
     style: Optional[str] = None
+
+
+class AssembleBody(BaseModel):
+    """Optional. Present only to override the env-configured callback target.
+
+    Optional with a None default so every existing caller that POSTs no body
+    at all keeps working.
+    """
+    callback_url: Optional[str] = None
+    callback_token: Optional[str] = None
 
 
 async def json_body(request: Request) -> dict:
@@ -1149,8 +1231,9 @@ def _assemble_core(job: str, allow_silent: int, allow_gaps: int, expect: int):
                      job, i, motion, dur, frames,
                      "" if wav.exists() else ", SILENT")
 
-            cmd = ["ffmpeg", "-y", "-loop", "1", "-framerate", str(OUT_FPS),
-                   "-t", f"{dur:.3f}", "-i", png.name]
+            cmd = (["ffmpeg", "-y"] + FILTER_THREAD_ARGS +
+                   ["-loop", "1", "-framerate", str(OUT_FPS),
+                    "-t", f"{dur:.3f}", "-i", png.name])
             if wav.exists():
                 cmd += ["-i", wav.name,
                         "-filter_complex", f"{vf};[1:a]apad[a]",
@@ -1167,7 +1250,7 @@ def _assemble_core(job: str, allow_silent: int, allow_gaps: int, expect: int):
             # tpad holds the last frame if the clip is shorter than its
             # narration; -t trims it if longer.
             chain = [f"[0:v]tpad=stop_mode=clone:stop_duration={dur:.3f},setsar=1[v]"]
-            cmd = ["ffmpeg", "-y", "-i", mp4.name]
+            cmd = ["ffmpeg", "-y"] + FILTER_THREAD_ARGS + ["-i", mp4.name]
 
             if wav.exists() and clip_has_audio:
                 chain.append(f"[0:a]volume={AMBIENT_VOLUME},apad[amb]")
@@ -1299,6 +1382,238 @@ def _read_assemble_state(job: str) -> Optional[dict]:
         return None
 
 
+# --------------------------------------------------------------------------
+# callback delivery
+# --------------------------------------------------------------------------
+# n8n does not poll. A background render that finishes and cannot tell anyone
+# is an episode stuck in `assembling` with nothing watching it, so delivery is
+# retried from the state file rather than attempted once from the render
+# thread. The file is the outbox: it survives the thread that wrote it, the
+# restart that killed the thread, and the box being down while n8n is up.
+
+
+def _callback_payload(job: str, state: dict) -> dict:
+    """Exactly what GET /assemble/{job}/status returns, plus an attempt count.
+
+    Deliberately the same shape: the eight tail nodes were written against the
+    poll response, and moving them to the webhook should not mean rewriting
+    their expressions.
+    """
+    cb = state.get("callback") or {}
+    payload = {
+        "job": job,
+        "state": state.get("state"),
+        "instance": state.get("instance"),
+        "started_at": state.get("started_at"),
+        "finished_at": state.get("finished_at"),
+        # n8n will see this >1 whenever a response was lost on the way back.
+        # It is the only signal that a duplicate is a duplicate.
+        "attempt": cb.get("attempts", 0) + 1,
+    }
+    if state.get("state") == "done":
+        payload["result"] = state.get("result")
+    else:
+        payload["status_code"] = state.get("status_code")
+        payload["error"] = state.get("error")
+    return payload
+
+
+def _deliver_callback(job: str) -> None:
+    """One delivery attempt. Records the outcome on the state file either way.
+
+    Never raises: called from a daemon thread and from the notifier loop, and
+    a callback failure must not change the render's own recorded outcome.
+    """
+    with _notify_lock:
+        if job in _notify_inflight:
+            return
+        _notify_inflight.add(job)
+    try:
+        state = _read_assemble_state(job)
+        if not state:
+            return
+        cb = state.get("callback") or {}
+        url = cb.get("url")
+        if (not url or cb.get("delivered") or cb.get("abandoned")
+                or state.get("state") not in ("done", "failed")):
+            return
+
+        payload = _callback_payload(job, state)
+        attempt = payload["attempt"]
+        headers = {"Content-Type": "application/json"}
+        token = cb.get("token") or CALLBACK_TOKEN
+        if token:
+            headers["X-Korinth-Token"] = token
+        if cb.get("request_id"):
+            # Carries the submit's request id into n8n, and back into this
+            # journal on the retry lines. One id spans the whole render.
+            headers["X-Request-Id"] = cb["request_id"]
+
+        started = time.monotonic()
+        status = None
+        err = None
+        try:
+            with httpx.Client(timeout=CALLBACK_TIMEOUT) as client:
+                r = client.post(url, json=payload, headers=headers)
+            status = r.status_code
+            ok = 200 <= status < 300
+            if not ok:
+                err = _clip(r.text or "", 300)
+        except httpx.HTTPError as e:
+            ok = False
+            err = f"{type(e).__name__}: {e}"
+
+        # Re-read rather than reusing the copy from before the POST: the record
+        # may have been rewritten while the request was open.
+        state = _read_assemble_state(job) or state
+        cb = state.get("callback") or cb
+        cb["attempts"] = attempt
+        cb["last_status"] = status
+        cb["last_error"] = err
+
+        if ok:
+            cb["delivered"] = True
+            cb["delivered_at"] = time.time()
+            cb.pop("next_attempt_at", None)
+            log.info("callback %s -> %s delivered on attempt %d in %.1fs",
+                     job, url, attempt, time.monotonic() - started)
+        else:
+            # Every non-2xx is retried, including 404. A 404 here usually means
+            # the workflow is not published yet, which is a state that gets
+            # fixed - refusing to retry it would strand the episode.
+            delay = min(CALLBACK_BACKOFF_MAX, 2.0 ** min(attempt, 8))
+            cb["next_attempt_at"] = time.time() + delay
+            log.warning("callback %s -> %s attempt %d failed after %.1fs "
+                        "(%s: %s); retrying in %.0fs", job, url, attempt,
+                        time.monotonic() - started, status or "no response",
+                        _clip(err or "", 200), delay)
+
+        state["callback"] = cb
+        _write_assemble_state(job, state)
+    except Exception:  # noqa: BLE001 - the notifier must survive anything
+        log.exception("callback %s: delivery attempt raised", job)
+    finally:
+        with _notify_lock:
+            _notify_inflight.discard(job)
+
+
+def _queue_callback(job: str) -> None:
+    threading.Thread(target=_deliver_callback, args=(job,),
+                     name=f"callback-{job}", daemon=True).start()
+
+
+def _notify_scan() -> None:
+    """Retry undelivered callbacks; retire state files nobody needs.
+
+    Also the startup rescan - it is the same scan, so there is one code path
+    for "n8n was down for an hour" and "this service was down for an hour".
+    """
+    now = time.time()
+    if not ASSEMBLE_STATE_DIR.exists():
+        return
+    for path in sorted(ASSEMBLE_STATE_DIR.glob("*.json")):
+        job = path.stem
+        state = _read_assemble_state(job)
+        if not state or state.get("state") not in ("done", "failed"):
+            continue
+        cb = state.get("callback") or {}
+
+        if not cb.get("url") or cb.get("delivered") or cb.get("abandoned"):
+            finished = state.get("finished_at") or 0
+            if finished and now - finished > STATE_RETENTION_SECONDS:
+                path.unlink(missing_ok=True)
+                log.info("retired assemble state for %s (%.1f days old)",
+                         job, (now - finished) / 86400)
+            continue
+
+        if now < cb.get("next_attempt_at", 0):
+            continue
+
+        queued = cb.get("first_queued_at") or state.get("finished_at") or now
+        if now - queued > CALLBACK_MAX_AGE_SECONDS:
+            cb["abandoned"] = True
+            state["callback"] = cb
+            _write_assemble_state(job, state)
+            # Loud on purpose. Nothing polls, so this is the only place the
+            # stuck row is ever going to be mentioned.
+            log.error("callback %s -> %s ABANDONED after %.1f hours and %d "
+                      "attempts (last: %s %s). The episode is still "
+                      "'assembling' in n8n and needs a hand: POST the payload "
+                      "from %s to the webhook by hand, or resubmit the render.",
+                      job, cb.get("url"), (now - queued) / 3600,
+                      cb.get("attempts", 0), cb.get("last_status"),
+                      _clip(cb.get("last_error") or "", 200), path)
+            continue
+
+        _queue_callback(job)
+
+
+def _notifier_loop() -> None:
+    while not _notify_stop.wait(CALLBACK_TICK):
+        try:
+            _notify_scan()
+        except Exception:  # noqa: BLE001
+            log.exception("callback notifier scan failed")
+
+
+def _promote_orphans() -> int:
+    """Fail every render owned by a process that is no longer here, and tell n8n.
+
+    /assemble/{job}/status already detects this, but only when something asks.
+    After the poller is deleted nothing asks, so the detection has to move to
+    startup - which is also strictly better: an OOM kill is reported the moment
+    the service comes back, rather than on whatever tick would have caught it.
+    """
+    if not ASSEMBLE_STATE_DIR.exists():
+        return 0
+    promoted = 0
+    for path in sorted(ASSEMBLE_STATE_DIR.glob("*.json")):
+        job = path.stem
+        state = _read_assemble_state(job)
+        if not state or state.get("state") != "running":
+            continue
+        if state.get("instance") == SERVICE_INSTANCE:
+            continue  # unreachable at startup; do not guess about it
+        log.error("assemble %s was running under instance %s when the service "
+                  "stopped; promoting to failed", job, state.get("instance"))
+        state["state"] = "failed"
+        state["status_code"] = 503
+        state["error"] = ("the service restarted while this assemble was "
+                          "running; resubmit it")
+        state["finished_at"] = time.time()
+        cb = state.get("callback")
+        if cb:
+            cb["first_queued_at"] = time.time()
+            cb["next_attempt_at"] = 0
+        _write_assemble_state(job, state)
+        promoted += 1
+    return promoted
+
+
+def _write_terminal_state(job: str, patch: dict) -> None:
+    """Write a terminal record, preserving the callback block from submit.
+
+    The three call sites in _assemble_worker used to build a fresh dict, which
+    would silently discard the callback target and leave the render finished
+    and unreported.
+    """
+    prior = _read_assemble_state(job) or {}
+    state = {
+        "instance": SERVICE_INSTANCE,
+        "started_at": prior.get("started_at"),
+        "finished_at": time.time(),
+        **patch,
+    }
+    cb = prior.get("callback")
+    if cb:
+        cb["first_queued_at"] = time.time()
+        cb["next_attempt_at"] = 0
+        state["callback"] = cb
+    _write_assemble_state(job, state)
+    if cb and cb.get("url"):
+        _queue_callback(job)
+
+
 def _assemble_worker(job: str, allow_silent: int, allow_gaps: int, expect: int) -> None:
     started = time.monotonic()
     try:
@@ -1308,50 +1623,39 @@ def _assemble_worker(job: str, allow_silent: int, allow_gaps: int, expect: int) 
         log.info("assemble %s (background): returning a path pointer and "
                  "deleting %s", job, d)
         shutil.rmtree(d, ignore_errors=True)
-        _write_assemble_state(job, {
-            "state": "done",
-            "instance": SERVICE_INSTANCE,
-            "finished_at": time.time(),
-            "result": payload,
-        })
+        _write_terminal_state(job, {"state": "done", "result": payload})
         log.info("assemble %s (background) done in %.0fs", job,
                  time.monotonic() - started)
     except HTTPException as exc:
         # The same 409/500 the synchronous route would have returned, kept as
-        # data so the poller gets the real reason instead of a bare "failed".
+        # data so the callback payload carries the real reason instead of a
+        # bare "failed".
         log.warning("assemble %s (background) failed after %.0fs: %s %s",
                     job, time.monotonic() - started, exc.status_code, exc.detail)
-        _write_assemble_state(job, {
-            "state": "failed",
-            "instance": SERVICE_INSTANCE,
-            "finished_at": time.time(),
-            "status_code": exc.status_code,
-            "error": str(exc.detail),
-        })
+        _write_terminal_state(job, {"state": "failed",
+                                    "status_code": exc.status_code,
+                                    "error": str(exc.detail)})
     except Exception as exc:  # noqa: BLE001 - a worker thread must not die silently
         log.exception("assemble %s (background) crashed after %.0fs",
                       job, time.monotonic() - started)
-        _write_assemble_state(job, {
-            "state": "failed",
-            "instance": SERVICE_INSTANCE,
-            "finished_at": time.time(),
-            "status_code": 500,
-            "error": f"{type(exc).__name__}: {exc}",
-        })
+        _write_terminal_state(job, {"state": "failed", "status_code": 500,
+                                    "error": f"{type(exc).__name__}: {exc}"})
 
 
 @app.post("/assemble/{job}")
-def assemble(job: str, request: Request, allow_silent: int = 0,
-             allow_gaps: int = 0, expect: int = 0, deliver: str = "file",
-             background: int = 0) -> Response:
+def assemble(job: str, request: Request, body: Optional[AssembleBody] = None,
+             allow_silent: int = 0, allow_gaps: int = 0, expect: int = 0,
+             deliver: str = "file", background: int = 0) -> Response:
     """Assemble a job's segments into the finished episode.
 
     background=0 (default) renders inline and returns the result, which is the
     v4.6 behaviour and is fine for short jobs.
 
-    background=1 returns 202 immediately and renders in a thread; poll
-    GET /assemble/{job}/status until state is done or failed. Requires
-    deliver=path, because there is no open request left to stream bytes down.
+    background=1 returns 202 immediately and renders in a thread. The service
+    POSTs the terminal state (done or failed) to CALLBACK_URL (or the
+    callback_url in the JSON body) when the render finishes, retrying with
+    backoff until it gets a 2xx. GET /assemble/{job}/status still exists but is
+    diagnostic only now - nothing in production polls it.
     """
     check_auth(request)
     sweep_old_jobs()
@@ -1366,6 +1670,19 @@ def assemble(job: str, request: Request, allow_silent: int = 0,
             raise HTTPException(
                 status_code=400,
                 detail="background=1 needs ARCHIVE_DIR set in the service env")
+        cb_url = (body.callback_url if body and body.callback_url
+                  else CALLBACK_URL)
+        if not cb_url:
+            # Fail closed. Nothing polls this service, so a background render
+            # with no callback target renders for forty minutes, archives the
+            # file and tells nobody - the exact failure the poller used to
+            # cover for.
+            raise HTTPException(
+                status_code=400,
+                detail="background=1 needs a callback target: set CALLBACK_URL "
+                       "in /etc/korinth-ffmpeg.env or send callback_url in the "
+                       "body. Nothing polls this service, so a render with no "
+                       "callback would finish and never be collected.")
         # Cheap up-front checks so an obviously broken job fails on submit
         # rather than looking healthy for 40 minutes.
         d = job_dir(job)
@@ -1387,11 +1704,19 @@ def assemble(job: str, request: Request, allow_silent: int = 0,
                 "state": "running",
                 "instance": SERVICE_INSTANCE,
                 "started_at": time.time(),
+                "callback": {
+                    "url": cb_url,
+                    "token": (body.callback_token if body else None) or None,
+                    "request_id": _request_id.get(),
+                    "delivered": False,
+                    "attempts": 0,
+                    "next_attempt_at": 0,
+                },
             })
 
         log.info("assemble %s: submitted for background render "
-                 "(allow_silent=%d allow_gaps=%d expect=%d)", job,
-                 allow_silent, allow_gaps, expect)
+                 "(allow_silent=%d allow_gaps=%d expect=%d callback=%s)", job,
+                 allow_silent, allow_gaps, expect, cb_url)
         threading.Thread(
             target=_assemble_worker,
             args=(job, allow_silent, allow_gaps, expect),
@@ -1400,7 +1725,7 @@ def assemble(job: str, request: Request, allow_silent: int = 0,
         ).start()
 
         return JSONResponse(
-            {"job": job, "state": "running",
+            {"job": job, "state": "running", "callback_url": cb_url,
              "status_url": f"/assemble/{job}/status"},
             status_code=202)
 
@@ -1432,10 +1757,13 @@ def assemble(job: str, request: Request, allow_silent: int = 0,
 
 @app.get("/assemble/{job}/status")
 def assemble_status(job: str, request: Request) -> dict:
-    """Report a background assemble.
+    """Report a background assemble. Diagnostic only - nothing in production
+    polls this any more; the terminal state is delivered by callback instead.
 
     states: running | done | failed. `done` carries the same payload the
     synchronous deliver=path route returns, so a caller can use it unchanged.
+    Includes the `callback` block, so this also answers "did n8n ever get
+    told" for a job stuck in n8n's `assembling` state.
     """
     check_auth(request)
     state = _read_assemble_state(job)
