@@ -121,14 +121,29 @@ systemctl enable "${SERVICE_NAME}" >/dev/null
 systemctl restart "${SERVICE_NAME}"
 
 # --- 5. shell aliases -----------------------------------------------------------
-# System-wide so they work for root and anyone else who logs into the LXC,
-# in any new interactive shell. Re-run of install.sh just overwrites this
-# file with the same content, so it's safe to re-run.
+# System-wide so they work for root and anyone else who logs into the LXC.
+# Re-run of install.sh just overwrites this file with the same content, so
+# it's safe to re-run.
+#
+# /etc/profile.d/*.sh is only sourced by *login* shells (a fresh SSH session,
+# `su -`). It is silently skipped by `sudo bash`, `sudo su`, an existing
+# tmux/screen pane, or any other non-login interactive shell — the most
+# common reason these aliases appear "not to work". So also source it from
+# /etc/bash.bashrc, which every interactive bash shell reads, login or not.
 cat > /etc/profile.d/korinth-ffmpeg.sh <<EOF
 alias korinth-update='${INSTALL_DIR}/update.sh'
 alias korinth-health='curl -s http://127.0.0.1:8080/health | jq'
 EOF
 chmod 644 /etc/profile.d/korinth-ffmpeg.sh
+
+SOURCE_LINE='[ -r /etc/profile.d/korinth-ffmpeg.sh ] && . /etc/profile.d/korinth-ffmpeg.sh'
+if [ -f /etc/bash.bashrc ] && ! grep -qF "${SOURCE_LINE}" /etc/bash.bashrc; then
+  {
+    echo ''
+    echo '# korinth-ffmpeg aliases (added by install.sh)'
+    echo "${SOURCE_LINE}"
+  } >> /etc/bash.bashrc
+fi
 
 # --- 6. confirm ----------------------------------------------------------------
 sleep 3
@@ -160,7 +175,8 @@ if ! grep -q '^CALLBACK_TOKEN=.' "${ENV_FILE}"; then
   echo "   WARNING     CALLBACK_TOKEN is unset; callbacks will be unauthenticated."
 fi
 echo
-echo " Aliases (open a new shell, or 'source /etc/profile.d/korinth-ffmpeg.sh'):"
+echo " Aliases (new shell picks these up automatically; this one needs"
+echo " 'source /etc/profile.d/korinth-ffmpeg.sh' first):"
 echo "   korinth-update   run update.sh (routine redeploys, no apt-get)"
 echo "   korinth-health   curl /health | jq"
 echo
