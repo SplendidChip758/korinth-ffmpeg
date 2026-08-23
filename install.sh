@@ -70,8 +70,10 @@ if [ ! -f "${ENV_FILE}" ]; then
   sed -i "s/^X_AUTH_TOKEN=.*/X_AUTH_TOKEN=${TOKEN}/" "${ENV_FILE}"
   echo "   generated new X-Auth-Token — copy it into your n8n Header Auth credential:"
   echo "   ${TOKEN}"
+  TOKEN_STATUS="generated above"
 else
   echo "-> env file exists, leaving token untouched"
+  TOKEN_STATUS="preserved (retrieve with root-only access to ${ENV_FILE})"
 fi
 
 # v4.6.0 deliberately does NOT migrate TTS_VOICE / TTS_STYLE out of the env
@@ -128,8 +130,6 @@ if command -v curl >/dev/null; then
 fi
 
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-TOKEN_VALUE="$(grep '^X_AUTH_TOKEN=' "${ENV_FILE}" | cut -d= -f2-)"
-
 echo
 echo "======================================================================"
 echo " korinth-ffmpeg ${DEPLOYED_VERSION}+${DEPLOYED_SHA} deployed and running."
@@ -137,7 +137,13 @@ echo
 echo "   Health      ${HEALTH}"
 echo "   Base URL    http://${IP:-<this-lxc-ip>}:8080"
 echo "   Header      X-Auth-Token"
-echo "   Token       ${TOKEN_VALUE}"
+echo "   Token       ${TOKEN_STATUS}"
+if ! grep -q '^CALLBACK_URL=.' "${ENV_FILE}"; then
+  echo "   WARNING     CALLBACK_URL is unset; background assembly will be refused."
+fi
+if ! grep -q '^CALLBACK_TOKEN=.' "${ENV_FILE}"; then
+  echo "   WARNING     CALLBACK_TOKEN is unset; callbacks will be unauthenticated."
+fi
 echo
 echo " POST /narrate needs a service account key at"
 echo " /etc/korinth-ffmpeg/service-account.json (Cloud Text-to-Speech), and"

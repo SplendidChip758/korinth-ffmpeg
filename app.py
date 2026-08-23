@@ -69,6 +69,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -93,6 +94,9 @@ SERVICE_TOKEN = (os.environ.get("X_AUTH_TOKEN")
                  or os.environ.get("SERVICE_TOKEN", "")).strip()
 MAX_JOB_AGE_SECONDS = int(os.environ.get("MAX_JOB_AGE_SECONDS", 6 * 60 * 60))
 MAX_CLIP_BYTES = int(os.environ.get("MAX_CLIP_BYTES", 200 * 1024 * 1024))
+# Base64 expands uploads by roughly one third. Reject oversized requests from
+# Content-Length before FastAPI reads the complete body into memory.
+MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", MAX_CLIP_BYTES * 4 // 3 + 1024 * 1024))
 FFMPEG_TIMEOUT = int(os.environ.get("FFMPEG_TIMEOUT", 1800))
 
 # Where a finished background render reports to. n8n no longer polls, so a
@@ -100,6 +104,8 @@ FFMPEG_TIMEOUT = int(os.environ.get("FFMPEG_TIMEOUT", 1800))
 # check in assemble().
 CALLBACK_URL = os.environ.get("CALLBACK_URL", "").strip()
 CALLBACK_TOKEN = os.environ.get("CALLBACK_TOKEN", "").strip()
+ALLOW_CALLBACK_OVERRIDE = os.environ.get("ALLOW_CALLBACK_OVERRIDE", "false").strip().lower() in ("1", "true", "yes", "on")
+CALLBACK_ALLOWED_HOSTS = frozenset(host.strip().lower() for host in os.environ.get("CALLBACK_ALLOWED_HOSTS", "").split(",") if host.strip())
 CALLBACK_TIMEOUT = float(os.environ.get("CALLBACK_TIMEOUT", "30"))
 # The notifier wakes on this interval to retry whatever did not land. It is a
 # stat() of one local directory, not a workflow execution - the thing that was
@@ -111,12 +117,15 @@ CALLBACK_MAX_AGE_SECONDS = int(os.environ.get("CALLBACK_MAX_AGE_SECONDS", 24 * 6
 # Terminal state files are never swept today (sweep_old_jobs skips the whole
 # underscore dir), so _assemble/ grows one file per episode forever.
 STATE_RETENTION_SECONDS = int(os.environ.get("STATE_RETENTION_SECONDS", 7 * 24 * 60 * 60))
+MAX_BACKGROUND_ASSEMBLIES = max(1, int(os.environ.get("MAX_BACKGROUND_ASSEMBLIES", "1")))
 
 # Background /assemble bookkeeping. Underscore-prefixed so sweep_old_jobs()
 # skips it; it has to outlive the job directory it describes, because
 # deliver=path deletes that directory on success.
 ASSEMBLE_STATE_DIR = DATA_DIR / "_assemble"
 _assemble_lock = threading.Lock()
+_assembly_slots = threading.BoundedSemaphore(MAX_BACKGROUND_ASSEMBLIES)
+_active_assemblies: set = set()
 _notify_inflight: set = set()
 _notify_lock = threading.Lock()
 _notify_stop = threading.Event()
@@ -376,7 +385,20 @@ async def log_requests(request: Request, call_next):
     quiet = request.url.path == "/health"
     log.debug("-> %s %s", request.method, request.url.path)
     try:
-        response = await call_next(request)
+        length = request.headers.get("content-length")
+        if length:
+            try:
+                size = int(length)
+            except ValueError:
+                size = -1
+            if size < 0:
+                response = JSONResponse({"detail": "invalid Content-Length"}, status_code=400)
+            elif size > MAX_REQUEST_BYTES:
+                response = JSONResponse({"detail": f"request exceeds maximum body size of {MAX_REQUEST_BYTES} bytes"}, status_code=413)
+            else:
+                response = await call_next(request)
+        else:
+            response = await call_next(request)
     except Exception:
         # Uvicorn logs the traceback too, but without the id, so this is what
         # ties the crash to the request that caused it.
@@ -863,6 +885,14 @@ def health() -> dict:
         "gcp_location": GCP_LOCATION,
         "archive_dir": str(ARCHIVE_DIR) if ARCHIVE_DIR else None,
         "archive_writable": bool(ARCHIVE_DIR and os.access(ARCHIVE_DIR, os.W_OK)),
+        "callback_configured": bool(CALLBACK_URL),
+        "callback_authenticated": bool(CALLBACK_TOKEN),
+        "callback_override_allowed": ALLOW_CALLBACK_OVERRIDE,
+        "background_assemblies": {
+            "active": len(_active_assemblies),
+            "maximum": MAX_BACKGROUND_ASSEMBLIES,
+        },
+        "max_request_bytes": MAX_REQUEST_BYTES,
     }
 
 
@@ -1367,10 +1397,14 @@ def _assemble_state_path(job: str) -> Path:
 
 def _write_assemble_state(job: str, state: dict) -> None:
     """Write atomically - a poller must never read a half-written state file."""
-    ASSEMBLE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    ASSEMBLE_STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(ASSEMBLE_STATE_DIR, 0o700)
     dest = _assemble_state_path(job)
     tmp = dest.with_name(dest.name + ".part")
-    tmp.write_text(json.dumps(state), encoding="utf-8")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(state))
+    os.chmod(tmp, 0o600)
     os.replace(tmp, dest)
 
 
@@ -1640,6 +1674,10 @@ def _assemble_worker(job: str, allow_silent: int, allow_gaps: int, expect: int) 
                       job, time.monotonic() - started)
         _write_terminal_state(job, {"state": "failed", "status_code": 500,
                                     "error": f"{type(exc).__name__}: {exc}"})
+    finally:
+        with _assemble_lock:
+            _active_assemblies.discard(job)
+        _assembly_slots.release()
 
 
 @app.post("/assemble/{job}")
@@ -1670,8 +1708,18 @@ def assemble(job: str, request: Request, body: Optional[AssembleBody] = None,
             raise HTTPException(
                 status_code=400,
                 detail="background=1 needs ARCHIVE_DIR set in the service env")
-        cb_url = (body.callback_url if body and body.callback_url
-                  else CALLBACK_URL)
+        override_url = body.callback_url if body else None
+        override_token = body.callback_token if body else None
+        if (override_url or override_token) and not ALLOW_CALLBACK_OVERRIDE:
+            raise HTTPException(status_code=403, detail="callback overrides are disabled")
+        if override_url:
+            parsed = urlsplit(override_url)
+            if parsed.scheme != "https" or not parsed.hostname:
+                raise HTTPException(status_code=400, detail="callback override must be an HTTPS URL")
+            allowed = CALLBACK_ALLOWED_HOSTS or ({urlsplit(CALLBACK_URL).hostname.lower()} if CALLBACK_URL and urlsplit(CALLBACK_URL).hostname else set())
+            if not allowed or parsed.hostname.lower() not in allowed:
+                raise HTTPException(status_code=403, detail="callback override host is not allowed")
+        cb_url = override_url or CALLBACK_URL
         if not cb_url:
             # Fail closed. Nothing polls this service, so a background render
             # with no callback target renders for forty minutes, archives the
@@ -1700,7 +1748,11 @@ def assemble(job: str, request: Request, body: Optional[AssembleBody] = None,
                      "detail": "an assemble is already running for this job",
                      "status_url": f"/assemble/{job}/status"},
                     status_code=202)
-            _write_assemble_state(job, {
+            if not _assembly_slots.acquire(blocking=False):
+                raise HTTPException(status_code=429, detail=f"background assembly capacity reached ({MAX_BACKGROUND_ASSEMBLIES}); retry without regenerating media", headers={"Retry-After": "60"})
+            _active_assemblies.add(job)
+            try:
+                _write_assemble_state(job, {
                 "state": "running",
                 "instance": SERVICE_INSTANCE,
                 "started_at": time.time(),
@@ -1712,17 +1764,29 @@ def assemble(job: str, request: Request, body: Optional[AssembleBody] = None,
                     "attempts": 0,
                     "next_attempt_at": 0,
                 },
-            })
+                })
+            except Exception:
+                _active_assemblies.discard(job)
+                _assembly_slots.release()
+                raise
 
         log.info("assemble %s: submitted for background render "
                  "(allow_silent=%d allow_gaps=%d expect=%d callback=%s)", job,
                  allow_silent, allow_gaps, expect, cb_url)
-        threading.Thread(
-            target=_assemble_worker,
-            args=(job, allow_silent, allow_gaps, expect),
-            name=f"assemble-{job}",
-            daemon=True,
-        ).start()
+        try:
+            threading.Thread(
+                target=_assemble_worker,
+                args=(job, allow_silent, allow_gaps, expect),
+                name=f"assemble-{job}",
+                daemon=True,
+            ).start()
+        except Exception:
+            with _assemble_lock:
+                _active_assemblies.discard(job)
+            _assembly_slots.release()
+            _write_terminal_state(job, {"state": "failed", "status_code": 503,
+                                        "error": "background worker could not start; resubmit the job"})
+            raise
 
         return JSONResponse(
             {"job": job, "state": "running", "callback_url": cb_url,
