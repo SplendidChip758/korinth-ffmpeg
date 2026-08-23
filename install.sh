@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# korinth-ffmpeg installer/updater — safe to re-run.
+# korinth-ffmpeg installer — safe to re-run.
 # Clones on first run, fetches+resets on every run after. Preserves the
 # auth token and any local env overrides. Run as root inside the LXC.
+#
+# For routine deploys after the first install, use update.sh instead — it
+# skips the apt-get/system-provisioning steps below and is much faster.
 
 set -euo pipefail
 
@@ -27,7 +30,7 @@ fi
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends \
-  git python3 python3-venv python3-pip ffmpeg curl ca-certificates openssl
+  git python3 python3-venv python3-pip ffmpeg curl ca-certificates openssl jq
 
 id -u "${APP_USER}" >/dev/null 2>&1 \
   || useradd --system --home-dir "${INSTALL_DIR}" --shell /usr/sbin/nologin "${APP_USER}"
@@ -53,6 +56,8 @@ else
   git clone --branch "${REF}" "${REPO_URL}" "${INSTALL_DIR}" 2>/dev/null \
     || { git clone "${REPO_URL}" "${INSTALL_DIR}" && git -C "${INSTALL_DIR}" checkout "${REF}"; }
 fi
+
+chmod +x "${INSTALL_DIR}/update.sh" 2>/dev/null || true
 
 DEPLOYED_SHA="$(git -C "${INSTALL_DIR}" rev-parse --short HEAD)"
 DEPLOYED_VERSION="$(cat "${INSTALL_DIR}/VERSION" 2>/dev/null || echo "0.0.0")"
@@ -115,7 +120,17 @@ systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}" >/dev/null
 systemctl restart "${SERVICE_NAME}"
 
-# --- 5. confirm ----------------------------------------------------------------
+# --- 5. shell aliases -----------------------------------------------------------
+# System-wide so they work for root and anyone else who logs into the LXC,
+# in any new interactive shell. Re-run of install.sh just overwrites this
+# file with the same content, so it's safe to re-run.
+cat > /etc/profile.d/korinth-ffmpeg.sh <<EOF
+alias korinth-update='${INSTALL_DIR}/update.sh'
+alias korinth-health='curl -s http://127.0.0.1:8080/health | jq'
+EOF
+chmod 644 /etc/profile.d/korinth-ffmpeg.sh
+
+# --- 6. confirm ----------------------------------------------------------------
 sleep 3
 if ! systemctl is-active --quiet "${SERVICE_NAME}"; then
   echo "!! service failed to start. Last 40 log lines:" >&2
@@ -144,6 +159,10 @@ fi
 if ! grep -q '^CALLBACK_TOKEN=.' "${ENV_FILE}"; then
   echo "   WARNING     CALLBACK_TOKEN is unset; callbacks will be unauthenticated."
 fi
+echo
+echo " Aliases (open a new shell, or 'source /etc/profile.d/korinth-ffmpeg.sh'):"
+echo "   korinth-update   run update.sh (routine redeploys, no apt-get)"
+echo "   korinth-health   curl /health | jq"
 echo
 echo " POST /narrate needs a service account key at"
 echo " /etc/korinth-ffmpeg/service-account.json (Cloud Text-to-Speech), and"

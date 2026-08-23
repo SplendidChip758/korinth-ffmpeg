@@ -53,6 +53,9 @@ back and nothing is kept on disk after the response.
 curl -fsSL https://raw.githubusercontent.com/youruser/korinth-ffmpeg/main/install.sh | bash
 # or, if the repo is already checked out at /opt/korinth-ffmpeg:
 cd /opt/korinth-ffmpeg && ./install.sh
+
+# routine redeploys after that, from anywhere:
+korinth-update
 ```
 
 `install.sh` is idempotent — install system deps, create the `korinth` user and
@@ -61,6 +64,22 @@ systemd unit, restart, confirm via `/health`. It never touches
 `/etc/korinth-ffmpeg.env` after the token exists, so re-running never breaks
 the n8n Header Auth credential. Run it as root; a bare LXC needs nothing done
 to it by hand first.
+
+`update.sh` does the routine subset of that — pull, refresh venv deps,
+reinstall the systemd unit, restart, confirm via `/health` — without the
+apt-get/system-provisioning steps, so it's much faster for day-to-day
+redeploys. It expects install.sh to have run at least once already. Run it
+as root, either directly (`/opt/korinth-ffmpeg/update.sh`) or via the
+`korinth-update` alias that install.sh sets up.
+
+`install.sh` also drops two aliases into `/etc/profile.d/korinth-ffmpeg.sh`
+(system-wide, any new shell — `source` that file, or open a new shell, to
+pick them up immediately after install):
+
+| | |
+|---|---|
+| `korinth-update` | run `update.sh` |
+| `korinth-health` | `curl -s http://127.0.0.1:8080/health \| jq` |
 
 `POST /narrate` calls Gemini TTS on **Cloud Text-to-Speech**, authenticated as
 a service account — GEAP's GCP project issues service account keys, not AI
