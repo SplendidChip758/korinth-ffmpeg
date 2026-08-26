@@ -1251,7 +1251,12 @@ def _assemble_core(job: str, allow_silent: int, allow_gaps: int, expect: int):
             images += 1
             motion_file = d / f"{i:03d}.motion"
             motion = motion_file.read_text(encoding="utf-8").strip() if motion_file.exists() else "kenburns"
-            vf = (f"[0:v]scale={WORK_W}:{WORK_H}:flags=lanczos,setsar=1,"
+            # Preserve the source aspect ratio. Portrait and square inputs are
+            # centered on a neutral canvas instead of being stretched to 16:9.
+            vf = (f"[0:v]scale={WORK_W}:{WORK_H}:"
+                  f"force_original_aspect_ratio=decrease:flags=lanczos,"
+                  f"pad={WORK_W}:{WORK_H}:(ow-iw)/2:(oh-ih)/2:"
+                  f"color=0x090d12,setsar=1,"
                   f"{motion_filter(motion, frames)},"
                   f"scale={OUT_W}:{OUT_H}:flags=lanczos[v]")
             # The motion is read back from disk, so a `?motion=` that n8n sent
