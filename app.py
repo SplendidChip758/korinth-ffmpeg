@@ -7,6 +7,7 @@ SHORTS path (unchanged since v2):
   PUT  /clip/{job}/{index}        raw mp4 bytes
   PUT  /narration/{job}           whole-video voiceover, base64
   POST /concat/{job}              join + mux one narration track
+  POST /excerpt                    derive a 9:16 excerpt from an archived episode
 
 LONG-FORM path (v4):
   PUT  /image64/{job}/{index}     base64 PNG + motion preset
@@ -800,6 +801,12 @@ class AssembleBody(BaseModel):
     """
     callback_url: Optional[str] = None
     callback_token: Optional[str] = None
+
+
+class ExcerptBody(BaseModel):
+    path: str
+    start_seconds: float = 0.0
+    duration_seconds: float = 45.0
 
 
 async def json_body(request: Request) -> dict:
@@ -1887,6 +1894,67 @@ async def put_narration(job: str, request: Request) -> dict:
     log.info("stored %s narration: %.0f KB %s @ %dHz x%d", job,
              len(audio) / 1024, fmt, meta["sample_rate"], meta["channels"])
     return {"job": job, "bytes": len(audio), "format": fmt}
+
+
+@app.post("/excerpt")
+def excerpt(body: ExcerptBody, request: Request) -> Response:
+    """Create a vertical excerpt from an archived long-form episode.
+
+    The complete 16:9 source remains visible at its original aspect ratio over
+    a blurred fill layer. This avoids stretching portraits or cropping away
+    characters merely to fill a 9:16 canvas.
+    """
+    check_auth(request)
+    if ARCHIVE_DIR is None:
+        raise HTTPException(status_code=503, detail="ARCHIVE_DIR is not configured")
+    if not (0 <= body.start_seconds):
+        raise HTTPException(status_code=400, detail="start_seconds must be non-negative")
+    if not (5 <= body.duration_seconds <= 60):
+        raise HTTPException(status_code=400, detail="duration_seconds must be between 5 and 60")
+
+    archive_root = ARCHIVE_DIR.resolve()
+    supplied = Path(body.path)
+    source = (supplied if supplied.is_absolute() else archive_root / supplied).resolve()
+    try:
+        source.relative_to(archive_root)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="excerpt path must be inside ARCHIVE_DIR")
+    if not source.is_file():
+        raise HTTPException(status_code=404, detail="archived episode not found")
+
+    source_duration = probe_duration(source)
+    if body.start_seconds >= source_duration:
+        raise HTTPException(status_code=400, detail="start_seconds is beyond the source duration")
+    duration = min(body.duration_seconds, source_duration - body.start_seconds)
+    excerpt_dir = DATA_DIR / "_excerpt"
+    excerpt_dir.mkdir(parents=True, exist_ok=True)
+    output = excerpt_dir / f"{source.stem}-{time.time_ns()}.mp4"
+    video_filter = (
+        "[0:v]split=2[bg][fg];"
+        "[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920,boxblur=20:10[bg];"
+        "[fg]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v]"
+    )
+    proc = run([
+        "ffmpeg", "-y", "-ss", f"{body.start_seconds:.3f}", "-i", str(source),
+        "-t", f"{duration:.3f}", "-filter_complex", video_filter,
+        "-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast",
+        "-crf", "20", "-r", "30", "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart", str(output)
+    ], label=f"excerpt {source.name}")
+    if proc.returncode != 0 or not output.exists():
+        output.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"excerpt failed: {(proc.stderr or '')[-2000:]}")
+    data = output.read_bytes()
+    output.unlink(missing_ok=True)
+    return Response(content=data, media_type="video/mp4", headers={
+        "Content-Disposition": f'attachment; filename="{source.stem}-short.mp4"',
+        "X-Source-Duration": f"{source_duration:.2f}",
+        "X-Excerpt-Start": f"{body.start_seconds:.2f}",
+        "X-Excerpt-Duration": f"{duration:.2f}",
+        "X-Canvas": "1080x1920",
+    })
 
 
 @app.post("/concat/{job}")
