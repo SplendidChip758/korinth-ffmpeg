@@ -900,6 +900,7 @@ def health() -> dict:
             "maximum": MAX_BACKGROUND_ASSEMBLIES,
         },
         "max_request_bytes": MAX_REQUEST_BYTES,
+        "excerpt_supported": True,
     }
 
 
