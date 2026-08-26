@@ -1255,7 +1255,10 @@ def _assemble_core(job: str, allow_silent: int, allow_gaps: int, expect: int):
         # final concat is a stream copy, so an audio track even a fraction
         # shorter than its video makes the voiceover creep ahead of the
         # picture, once per segment, cumulatively.
-        if png.exists():
+        # A video segment keeps its PNG keyframe as a generation/reference
+        # artifact, so both files can legitimately exist. Prefer the finished
+        # MP4 and use the PNG only when no clip was stored.
+        if png.exists() and not mp4.exists():
             images += 1
             motion_file = d / f"{i:03d}.motion"
             motion = motion_file.read_text(encoding="utf-8").strip() if motion_file.exists() else "kenburns"
