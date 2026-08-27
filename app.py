@@ -1946,7 +1946,7 @@ def excerpt(body: ExcerptBody, request: Request) -> Response:
         "-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast",
         "-crf", "20", "-r", "30", "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart", str(output)
-    ], label=f"excerpt {source.name}")
+    ], cwd=excerpt_dir, label=f"excerpt {source.name}")
     if proc.returncode != 0 or not output.exists():
         output.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"excerpt failed: {(proc.stderr or '')[-2000:]}")
