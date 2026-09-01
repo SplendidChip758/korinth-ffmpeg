@@ -60,14 +60,17 @@ class StateFileTests(unittest.TestCase):
         self.api["_write_assemble_state"]("episode-01", state)
         self.assertEqual(self.api["_read_assemble_state"]("episode-01"), state)
 
+    @unittest.skipUnless(os.name == "posix", "POSIX permission bits are not enforced on Windows")
     def test_state_directory_is_private(self):
         self.api["_write_assemble_state"]("episode-01", {"state": "running"})
         self.assertEqual(stat.S_IMODE(self.state_dir.stat().st_mode), 0o700)
 
+    @unittest.skipUnless(os.name == "posix", "POSIX permission bits are not enforced on Windows")
     def test_state_file_is_private(self):
         self.api["_write_assemble_state"]("episode-01", {"state": "running"})
         self.assertEqual(stat.S_IMODE((self.state_dir / "episode-01.json").stat().st_mode), 0o600)
 
+    @unittest.skipUnless(os.name == "posix", "POSIX permission bits are not enforced on Windows")
     def test_existing_public_directory_is_corrected(self):
         self.state_dir.mkdir(mode=0o755)
         os.chmod(self.state_dir, 0o755)
@@ -121,6 +124,12 @@ class ConfigurationTests(unittest.TestCase):
     def test_request_body_limit_is_enforced_before_handler(self):
         self.assertIn('request.headers.get("content-length")', APP_SOURCE)
         self.assertIn("status_code=413", APP_SOURCE)
+
+    def test_short_profile_is_true_portrait(self):
+        self.assertIn("SHORT_OUT_W, SHORT_OUT_H = 1080, 1920", APP_SOURCE)
+        self.assertIn('profile == "short"', APP_SOURCE)
+        self.assertIn('"X-Video-Width": str(out_w)', APP_SOURCE)
+        self.assertIn('"X-Video-Height": str(out_h)', APP_SOURCE)
 
 
 if __name__ == "__main__":

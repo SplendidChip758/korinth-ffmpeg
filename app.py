@@ -182,6 +182,13 @@ WORK_W, WORK_H = 7680, 4320
 # whole-pixel step into a sub-pixel one.
 ZOOM_W, ZOOM_H = 3840, 2160
 
+# Companion Shorts use a real portrait render pipeline. Feeding a 9:16 still
+# through the landscape constants above stretches it to 16:9, which causes
+# YouTube to package the upload as a regular video.
+SHORT_OUT_W, SHORT_OUT_H = 1080, 1920
+SHORT_WORK_W, SHORT_WORK_H = 4320, 7680
+SHORT_ZOOM_W, SHORT_ZOOM_H = 2160, 3840
+
 # Service account, not the AI Studio API-key surface — GEAP's GCP project only
 # issues service account keys, not GEMINI_API_KEY values. The project id lives
 # in the key file itself, so GCP_PROJECT_ID is only needed to override it (e.g.
@@ -822,7 +829,8 @@ async def json_body(request: Request) -> dict:
         raise HTTPException(status_code=400, detail="body must be JSON")
 
 
-def motion_filter(motion: str, frames: int) -> str:
+def motion_filter(motion: str, frames: int,
+                  zoom_w: int = ZOOM_W, zoom_h: int = ZOOM_H) -> str:
     """
     Ken Burns preset. Applied AFTER an upscale to WORK_W x WORK_H, so the zoom
     always crops into an oversized source and never has to invent detail, and
@@ -832,7 +840,7 @@ def motion_filter(motion: str, frames: int) -> str:
     """
     f = max(frames, 2)
     centre = "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
-    tail = f":d={f}:s={ZOOM_W}x{ZOOM_H}:fps={OUT_FPS}"
+    tail = f":d={f}:s={zoom_w}x{zoom_h}:fps={OUT_FPS}"
 
     if motion == "zoom_out":
         return f"zoompan=z='max(1.12-0.12*on/{f},1.0)':{centre}{tail}"
@@ -1179,7 +1187,8 @@ def narrate(job: str, index: int, request: Request, body: NarrateBody) -> dict:
 # assembly
 # --------------------------------------------------------------------------
 
-def _assemble_core(job: str, allow_silent: int, allow_gaps: int, expect: int):
+def _assemble_core(job: str, allow_silent: int, allow_gaps: int, expect: int,
+                   profile: str = "landscape"):
     """Render every segment, concat, archive.
 
     Returns (job_dir, final_name, payload, stats_headers). Delivery and cleanup
@@ -1187,6 +1196,17 @@ def _assemble_core(job: str, allow_silent: int, allow_gaps: int, expect: int):
     endpoint and the background worker.
     """
     assemble_started = time.monotonic()
+    if profile == "short":
+        out_w, out_h = SHORT_OUT_W, SHORT_OUT_H
+        work_w, work_h = SHORT_WORK_W, SHORT_WORK_H
+        zoom_w, zoom_h = SHORT_ZOOM_W, SHORT_ZOOM_H
+    elif profile == "landscape":
+        out_w, out_h = OUT_W, OUT_H
+        work_w, work_h = WORK_W, WORK_H
+        zoom_w, zoom_h = ZOOM_W, ZOOM_H
+    else:
+        raise HTTPException(status_code=400,
+                            detail="profile must be landscape or short")
 
     d = job_dir(job)
     if not d.exists():
@@ -1196,9 +1216,9 @@ def _assemble_core(job: str, allow_silent: int, allow_gaps: int, expect: int):
     if not indices:
         raise HTTPException(status_code=404, detail=f"no segments stored for job {job}")
 
-    log.info("assemble %s: %d segments %s (allow_silent=%d allow_gaps=%d "
-             "expect=%d)", job, len(indices), indices,
-             allow_silent, allow_gaps, expect)
+    log.info("assemble %s: %d segments %s (profile=%s %dx%d "
+             "allow_silent=%d allow_gaps=%d expect=%d)", job, len(indices),
+             indices, profile, out_w, out_h, allow_silent, allow_gaps, expect)
 
     # A missing segment is invisible in the output - the video just loses a
     # story beat and nothing errors. Both checks below exist to make that loud.
@@ -1264,12 +1284,12 @@ def _assemble_core(job: str, allow_silent: int, allow_gaps: int, expect: int):
             motion = motion_file.read_text(encoding="utf-8").strip() if motion_file.exists() else "kenburns"
             # Preserve the source aspect ratio. Portrait and square inputs are
             # centered on a neutral canvas instead of being stretched to 16:9.
-            vf = (f"[0:v]scale={WORK_W}:{WORK_H}:"
+            vf = (f"[0:v]scale={work_w}:{work_h}:"
                   f"force_original_aspect_ratio=decrease:flags=lanczos,"
-                  f"pad={WORK_W}:{WORK_H}:(ow-iw)/2:(oh-ih)/2:"
+                  f"pad={work_w}:{work_h}:(ow-iw)/2:(oh-ih)/2:"
                   f"color=0x090d12,setsar=1,"
-                  f"{motion_filter(motion, frames)},"
-                  f"scale={OUT_W}:{OUT_H}:flags=lanczos[v]")
+                  f"{motion_filter(motion, frames, zoom_w, zoom_h)},"
+                  f"scale={out_w}:{out_h}:flags=lanczos[v]")
             # The motion is read back from disk, so a `?motion=` that n8n sent
             # wrong was silently replaced with kenburns at ingest and this is
             # where that becomes visible.
@@ -1368,6 +1388,9 @@ def _assemble_core(job: str, allow_silent: int, allow_gaps: int, expect: int):
         "X-Clip-Count": str(videos),
         "X-Narration-Count": str(narrations),
         "X-Duration": f"{total:.2f}",
+        "X-Render-Profile": profile,
+        "X-Video-Width": str(out_w),
+        "X-Video-Height": str(out_h),
     }
     if archived:
         stats["X-Archive-Path"] = archived
@@ -1381,6 +1404,9 @@ def _assemble_core(job: str, allow_silent: int, allow_gaps: int, expect: int):
         "clips": videos,
         "narrations": narrations,
         "duration_seconds": round(total, 2),
+        "profile": profile,
+        "width": out_w,
+        "height": out_h,
     }
     return d, final, payload, stats
 
@@ -1664,10 +1690,12 @@ def _write_terminal_state(job: str, patch: dict) -> None:
         _queue_callback(job)
 
 
-def _assemble_worker(job: str, allow_silent: int, allow_gaps: int, expect: int) -> None:
+def _assemble_worker(job: str, allow_silent: int, allow_gaps: int, expect: int,
+                     profile: str) -> None:
     started = time.monotonic()
     try:
-        d, _final, payload, _stats = _assemble_core(job, allow_silent, allow_gaps, expect)
+        d, _final, payload, _stats = _assemble_core(
+            job, allow_silent, allow_gaps, expect, profile)
         # The only log line naming the job dir before it goes: after this,
         # the archived copy is the only one left.
         log.info("assemble %s (background): returning a path pointer and "
@@ -1699,7 +1727,8 @@ def _assemble_worker(job: str, allow_silent: int, allow_gaps: int, expect: int) 
 @app.post("/assemble/{job}")
 def assemble(job: str, request: Request, body: Optional[AssembleBody] = None,
              allow_silent: int = 0, allow_gaps: int = 0, expect: int = 0,
-             deliver: str = "file", background: int = 0) -> Response:
+             deliver: str = "file", background: int = 0,
+             profile: str = "landscape") -> Response:
     """Assemble a job's segments into the finished episode.
 
     background=0 (default) renders inline and returns the result, which is the
@@ -1713,6 +1742,9 @@ def assemble(job: str, request: Request, body: Optional[AssembleBody] = None,
     """
     check_auth(request)
     sweep_old_jobs()
+    if profile not in ("landscape", "short"):
+        raise HTTPException(status_code=400,
+                            detail="profile must be landscape or short")
 
     if background:
         if deliver != "path":
@@ -1792,7 +1824,7 @@ def assemble(job: str, request: Request, body: Optional[AssembleBody] = None,
         try:
             threading.Thread(
                 target=_assemble_worker,
-                args=(job, allow_silent, allow_gaps, expect),
+                args=(job, allow_silent, allow_gaps, expect, profile),
                 name=f"assemble-{job}",
                 daemon=True,
             ).start()
@@ -1809,7 +1841,8 @@ def assemble(job: str, request: Request, body: Optional[AssembleBody] = None,
              "status_url": f"/assemble/{job}/status"},
             status_code=202)
 
-    d, final, payload, stats = _assemble_core(job, allow_silent, allow_gaps, expect)
+    d, final, payload, stats = _assemble_core(
+        job, allow_silent, allow_gaps, expect, profile)
 
     if deliver == "path":
         if payload["path"] is None:
